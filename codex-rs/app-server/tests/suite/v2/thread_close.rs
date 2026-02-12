@@ -12,6 +12,7 @@ use codex_app_server_protocol::RequestId;
 use codex_app_server_protocol::ServerNotification;
 use codex_app_server_protocol::ThreadCloseParams;
 use codex_app_server_protocol::ThreadCloseResponse;
+use codex_app_server_protocol::ThreadCloseStatus;
 use codex_app_server_protocol::ThreadItem;
 use codex_app_server_protocol::ThreadLoadedListParams;
 use codex_app_server_protocol::ThreadLoadedListResponse;
@@ -49,7 +50,8 @@ async fn thread_close_unloads_thread_and_emits_thread_closed_notification() -> R
         mcp.read_stream_until_response_message(RequestId::Integer(close_id)),
     )
     .await??;
-    let _: ThreadCloseResponse = to_response::<ThreadCloseResponse>(close_resp)?;
+    let close = to_response::<ThreadCloseResponse>(close_resp)?;
+    assert_eq!(close.status, ThreadCloseStatus::Closed);
 
     let closed_notif: JSONRPCNotification = timeout(
         DEFAULT_READ_TIMEOUT,
@@ -143,7 +145,8 @@ async fn thread_close_during_turn_interrupts_turn_and_emits_thread_closed() -> R
         mcp.read_stream_until_response_message(RequestId::Integer(close_id)),
     )
     .await??;
-    let _: ThreadCloseResponse = to_response::<ThreadCloseResponse>(close_resp)?;
+    let close = to_response::<ThreadCloseResponse>(close_resp)?;
+    assert_eq!(close.status, ThreadCloseStatus::Closed);
 
     let completed_notif: JSONRPCNotification = timeout(
         DEFAULT_READ_TIMEOUT,

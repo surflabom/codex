@@ -1610,7 +1610,19 @@ pub struct ThreadCloseParams {
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, JsonSchema, TS)]
 #[serde(rename_all = "camelCase")]
 #[ts(export_to = "v2/")]
-pub struct ThreadCloseResponse {}
+pub struct ThreadCloseResponse {
+    pub status: ThreadCloseStatus,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq, JsonSchema, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export_to = "v2/")]
+pub enum ThreadCloseStatus {
+    Closed,
+    NotLoaded,
+    ShutdownSubmitFailed,
+    ShutdownTimedOut,
+}
 
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, JsonSchema, TS)]
 #[serde(rename_all = "camelCase")]

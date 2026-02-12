@@ -14763,8 +14763,25 @@
       },
       "ThreadCloseResponse": {
         "$schema": "http://json-schema.org/draft-07/schema#",
+        "properties": {
+          "status": {
+            "$ref": "#/definitions/v2/ThreadCloseStatus"
+          }
+        },
+        "required": [
+          "status"
+        ],
         "title": "ThreadCloseResponse",
         "type": "object"
+      },
+      "ThreadCloseStatus": {
+        "enum": [
+          "closed",
+          "notLoaded",
+          "shutdownSubmitFailed",
+          "shutdownTimedOut"
+        ],
+        "type": "string"
       },
       "ThreadClosedNotification": {
         "$schema": "http://json-schema.org/draft-07/schema#",

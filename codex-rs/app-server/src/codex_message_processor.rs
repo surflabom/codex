@@ -124,6 +124,7 @@ use codex_app_server_protocol::ThreadBackgroundTerminalsCleanParams;
 use codex_app_server_protocol::ThreadBackgroundTerminalsCleanResponse;
 use codex_app_server_protocol::ThreadCloseParams;
 use codex_app_server_protocol::ThreadCloseResponse;
+use codex_app_server_protocol::ThreadCloseStatus;
 use codex_app_server_protocol::ThreadClosedNotification;
 use codex_app_server_protocol::ThreadCompactStartParams;
 use codex_app_server_protocol::ThreadCompactStartResponse;
@@ -4299,9 +4300,9 @@ impl CodexMessageProcessor {
             }
         };
 
-        if let Some(thread) = self.thread_manager.remove_thread(&thread_id).await {
+        let status = if let Some(thread) = self.thread_manager.remove_thread(&thread_id).await {
             info!("thread {thread_id} was active; shutting down");
-            match thread.submit(Op::Shutdown).await {
+            let status = match thread.submit(Op::Shutdown).await {
                 Ok(_) => {
                     let wait_for_shutdown = async {
                         loop {
@@ -4316,26 +4317,36 @@ impl CodexMessageProcessor {
                         .is_err()
                     {
                         warn!("thread {thread_id} shutdown timed out; proceeding with close");
+                        ThreadCloseStatus::ShutdownTimedOut
+                    } else {
+                        ThreadCloseStatus::Closed
                     }
                 }
                 Err(err) => {
                     warn!("failed to submit Shutdown to thread {thread_id}: {err}");
+                    ThreadCloseStatus::ShutdownSubmitFailed
                 }
+            };
+
+            if matches!(status, ThreadCloseStatus::Closed) {
+                let notification = ThreadClosedNotification {
+                    thread_id: thread_id.to_string(),
+                };
+                self.outgoing
+                    .send_server_notification(ServerNotification::ThreadClosed(notification))
+                    .await;
             }
 
-            let notification = ThreadClosedNotification {
-                thread_id: thread_id.to_string(),
-            };
-            self.outgoing
-                .send_server_notification(ServerNotification::ThreadClosed(notification))
-                .await;
-        }
+            status
+        } else {
+            ThreadCloseStatus::NotLoaded
+        };
 
         self.thread_state_manager
             .remove_thread_state(thread_id)
             .await;
         self.outgoing
-            .send_response(request_id, ThreadCloseResponse {})
+            .send_response(request_id, ThreadCloseResponse { status })
             .await;
     }
 

@@ -141,6 +141,7 @@ export type { ThreadArchiveParams } from "./ThreadArchiveParams";
 export type { ThreadArchiveResponse } from "./ThreadArchiveResponse";
 export type { ThreadCloseParams } from "./ThreadCloseParams";
 export type { ThreadCloseResponse } from "./ThreadCloseResponse";
+export type { ThreadCloseStatus } from "./ThreadCloseStatus";
 export type { ThreadClosedNotification } from "./ThreadClosedNotification";
 export type { ThreadCompactStartParams } from "./ThreadCompactStartParams";
 export type { ThreadCompactStartResponse } from "./ThreadCompactStartResponse";
