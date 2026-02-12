@@ -110,7 +110,6 @@ use codex_core::protocol::WarningEvent;
 use codex_core::protocol::WebSearchBeginEvent;
 use codex_core::protocol::WebSearchEndEvent;
 use codex_core::skills::model::SkillMetadata;
-use codex_core::state_db::read_feedback_logs;
 #[cfg(target_os = "windows")]
 use codex_core::windows_sandbox::WindowsSandboxLevelExt;
 use codex_otel::OtelManager;
@@ -1130,7 +1129,6 @@ impl ChatWidget {
         } else {
             None
         };
-        let sqlite_feedback_logs = self.sqlite_feedback_logs(include_logs);
         let view = crate::bottom_pane::FeedbackNoteView::new(
             category,
             snapshot,
@@ -1138,25 +1136,9 @@ impl ChatWidget {
             self.app_event_tx.clone(),
             include_logs,
             self.feedback_audience,
-            sqlite_feedback_logs,
         );
         self.bottom_pane.show_view(Box::new(view));
         self.request_redraw();
-    }
-
-    fn sqlite_feedback_logs(&self, include_logs: bool) -> Option<Vec<u8>> {
-        if !include_logs || !self.config.features.enabled(Feature::Sqlite) {
-            return None;
-        }
-        let thread_id = self.thread_id;
-        let config = self.config.clone();
-        let Ok(handle) = tokio::runtime::Handle::try_current() else {
-            return None;
-        };
-
-        tokio::task::block_in_place(|| {
-            handle.block_on(async { read_feedback_logs(&config, thread_id).await })
-        })
     }
 
     pub(crate) fn open_app_link_view(
@@ -5558,7 +5540,7 @@ impl ChatWidget {
         let mut header_children: Vec<Box<dyn Renderable>> = Vec::new();
         let describe_policy = |policy: &SandboxPolicy| match policy {
             SandboxPolicy::WorkspaceWrite { .. } => "Agent mode",
-            SandboxPolicy::ReadOnly => "Read-Only mode",
+            SandboxPolicy::ReadOnly { .. } => "Read-Only mode",
             _ => "Agent mode",
         };
         let mode_label = preset
