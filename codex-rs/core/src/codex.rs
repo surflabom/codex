@@ -1420,6 +1420,17 @@ impl Session {
         }
     }
 
+    // WARNING: Only call this after successful model-switch compaction.
+    // Switching base instructions before compaction can make the next sampling request mix
+    // old-history content with new-model base instructions, causing prompt-cache misses
+    // and pushing the prompt out of distribution for the target model.
+    pub(crate) async fn set_base_instructions_for_turn_model(&self, turn_context: &TurnContext) {
+        let mut state = self.state.lock().await;
+        state.session_configuration.base_instructions = turn_context
+            .model_info
+            .get_model_instructions(turn_context.personality);
+    }
+
     pub(crate) async fn merge_mcp_tool_selection(&self, tool_names: Vec<String>) -> Vec<String> {
         let mut state = self.state.lock().await;
         state.merge_mcp_tool_selection(tool_names)
@@ -4347,12 +4358,16 @@ async fn run_pre_sampling_compact(
     turn_context: &Arc<TurnContext>,
 ) -> CodexResult<()> {
     let total_usage_tokens_before_compaction = sess.get_total_token_usage().await;
-    maybe_run_previous_model_inline_compact(
+    let ran_previous_model_compaction = maybe_run_previous_model_inline_compact(
         sess,
         turn_context,
         total_usage_tokens_before_compaction,
     )
     .await?;
+    if ran_previous_model_compaction {
+        sess.set_base_instructions_for_turn_model(turn_context.as_ref())
+            .await;
+    }
     let total_usage_tokens = sess.get_total_token_usage().await;
     let auto_compact_limit = turn_context
         .model_info
@@ -4369,9 +4384,9 @@ async fn maybe_run_previous_model_inline_compact(
     sess: &Arc<Session>,
     turn_context: &Arc<TurnContext>,
     total_usage_tokens: i64,
-) -> CodexResult<()> {
+) -> CodexResult<bool> {
     let Some(previous_model) = sess.previous_model().await else {
-        return Ok(());
+        return Ok(false);
     };
     let previous_turn_context = Arc::new(
         turn_context
@@ -4380,10 +4395,10 @@ async fn maybe_run_previous_model_inline_compact(
     );
 
     let Some(old_context_window) = previous_turn_context.model_context_window() else {
-        return Ok(());
+        return Ok(false);
     };
     let Some(new_context_window) = turn_context.model_context_window() else {
-        return Ok(());
+        return Ok(false);
     };
     let new_auto_compact_limit = turn_context
         .model_info
@@ -4394,8 +4409,9 @@ async fn maybe_run_previous_model_inline_compact(
         && old_context_window > new_context_window;
     if should_run {
         run_auto_compact(sess, &previous_turn_context).await?;
+        return Ok(true);
     }
-    Ok(())
+    Ok(false)
 }
 
 async fn run_auto_compact(sess: &Arc<Session>, turn_context: &Arc<TurnContext>) -> CodexResult<()> {

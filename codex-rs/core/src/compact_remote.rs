@@ -3,6 +3,7 @@ use std::sync::Arc;
 use crate::Prompt;
 use crate::codex::Session;
 use crate::codex::TurnContext;
+use crate::compact::strip_model_switch_developer_messages;
 use crate::context_manager::ContextManager;
 use crate::context_manager::TotalTokenUsageBreakdown;
 use crate::context_manager::estimate_response_item_model_visible_bytes;
@@ -65,6 +66,7 @@ async fn run_remote_compact_task_inner_impl(
     sess.emit_turn_item_started(turn_context, &compaction_item)
         .await;
     let mut history = sess.clone_history().await;
+    strip_model_switch_developer_messages(&mut history);
     let base_instructions = sess.get_base_instructions().await;
     let deleted_items = trim_function_call_history_to_fit_context_window(
         &mut history,

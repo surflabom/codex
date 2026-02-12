@@ -127,20 +127,27 @@ fn model_info_with_context_window(slug: &str, context_window: i64) -> ModelInfo 
 }
 
 fn assert_pre_sampling_switch_compaction_requests(
-    first: &serde_json::Value,
-    compact: &serde_json::Value,
-    follow_up: &serde_json::Value,
+    first: &core_test_support::responses::ResponsesRequest,
+    compact: &core_test_support::responses::ResponsesRequest,
+    follow_up: &core_test_support::responses::ResponsesRequest,
     previous_model: &str,
     next_model: &str,
 ) {
-    assert_eq!(first["model"].as_str(), Some(previous_model));
-    assert_eq!(compact["model"].as_str(), Some(previous_model));
-    assert_eq!(follow_up["model"].as_str(), Some(next_model));
+    let first_body_json = first.body_json();
+    let compact_body_json = compact.body_json();
+    let follow_up_body_json = follow_up.body_json();
+    assert_eq!(first_body_json["model"].as_str(), Some(previous_model));
+    assert_eq!(compact_body_json["model"].as_str(), Some(previous_model));
+    assert_eq!(follow_up_body_json["model"].as_str(), Some(next_model));
 
-    let compact_body = compact.to_string();
+    let compact_body = compact_body_json.to_string();
     assert!(
         body_contains_text(&compact_body, SUMMARIZATION_PROMPT),
         "pre-sampling compact request should include summarization prompt"
+    );
+    assert!(
+        !compact_body.contains("<model_switch>"),
+        "pre-sampling compact request should not include model-switch developer instructions"
     );
 }
 
@@ -1727,9 +1734,9 @@ async fn pre_sampling_compact_runs_on_switch_to_smaller_context_model() {
         "expected user, compact, and follow-up requests"
     );
     assert_pre_sampling_switch_compaction_requests(
-        &requests[0].body_json(),
-        &requests[1].body_json(),
-        &requests[2].body_json(),
+        &requests[0],
+        &requests[1],
+        &requests[2],
         previous_model,
         next_model,
     );
@@ -1870,9 +1877,9 @@ async fn pre_sampling_compact_runs_after_resume_and_switch_to_smaller_model() {
         "expected user, compact, and follow-up requests"
     );
     assert_pre_sampling_switch_compaction_requests(
-        &requests[0].body_json(),
-        &requests[1].body_json(),
-        &requests[2].body_json(),
+        &requests[0],
+        &requests[1],
+        &requests[2],
         previous_model,
         next_model,
     );
