@@ -129,6 +129,16 @@ fn assert_pre_sampling_switch_compaction_requests(
         body_contains_text(&compact_body, SUMMARIZATION_PROMPT),
         "pre-sampling compact request should include summarization prompt"
     );
+    let first_body = first.to_string();
+    assert!(
+        body_contains_text(&first_body, "<environment_context>"),
+        "first request should include canonical environment context"
+    );
+    let follow_up_body = follow_up.to_string();
+    assert!(
+        body_contains_text(&follow_up_body, "<environment_context>"),
+        "follow-up request should preserve canonical environment context after pre-sampling compaction"
+    );
 }
 
 async fn assert_compaction_uses_turn_lifecycle_id(codex: &std::sync::Arc<codex_core::CodexThread>) {
