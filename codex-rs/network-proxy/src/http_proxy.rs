@@ -17,7 +17,6 @@ use crate::responses::blocked_header_value;
 use crate::responses::blocked_message_with_policy;
 use crate::responses::blocked_text_response_with_policy;
 use crate::responses::json_response;
-use crate::responses::policy_decision_prefix;
 use crate::runtime::unix_socket_permissions_supported;
 use crate::state::BlockedRequest;
 use crate::state::BlockedRequestArgs;
@@ -643,14 +642,15 @@ fn client_addr<T: ExtensionsRef>(input: &T) -> Option<String> {
 }
 
 fn request_network_attempt_id(req: &Request) -> Option<String> {
+    // Some HTTP stacks normalize proxy credentials into `authorization`; accept both.
     attempt_id_from_proxy_authorization(req.headers().get("proxy-authorization"))
+        .or_else(|| attempt_id_from_proxy_authorization(req.headers().get("authorization")))
 }
 
 fn json_blocked(host: &str, reason: &str, details: Option<&PolicyDecisionDetails<'_>>) -> Response {
-    let (policy_decision_prefix, message, decision, source, protocol, port) = details
+    let (message, decision, source, protocol, port) = details
         .map(|details| {
             (
-                Some(policy_decision_prefix(details)),
                 Some(blocked_message_with_policy(reason, details)),
                 Some(details.decision.as_str()),
                 Some(details.source.as_str()),
@@ -658,7 +658,7 @@ fn json_blocked(host: &str, reason: &str, details: Option<&PolicyDecisionDetails
                 Some(details.port),
             )
         })
-        .unwrap_or((None, None, None, None, None, None));
+        .unwrap_or((None, None, None, None, None));
     let response = BlockedResponse {
         status: "blocked",
         host,
@@ -667,7 +667,6 @@ fn json_blocked(host: &str, reason: &str, details: Option<&PolicyDecisionDetails
         source,
         protocol,
         port,
-        policy_decision_prefix,
         message,
     };
     let mut resp = json_response(&response);
@@ -748,8 +747,6 @@ struct BlockedResponse<'a> {
     #[serde(skip_serializing_if = "Option::is_none")]
     port: Option<u16>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    policy_decision_prefix: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
     message: Option<String>,
 }
 
@@ -760,6 +757,8 @@ mod tests {
     use crate::config::NetworkMode;
     use crate::config::NetworkProxySettings;
     use crate::runtime::network_proxy_state_for_policy;
+    use base64::Engine;
+    use base64::engine::general_purpose::STANDARD;
     use pretty_assertions::assert_eq;
     use rama_http::Method;
     use rama_http::Request;
@@ -787,6 +786,36 @@ mod tests {
         assert_eq!(
             response.headers().get("x-proxy-error").unwrap(),
             "blocked-by-method-policy"
+        );
+    }
+
+    #[test]
+    fn request_network_attempt_id_reads_proxy_authorization_header() {
+        let encoded = STANDARD.encode("codex-net-attempt-attempt-1:");
+        let req = Request::builder()
+            .method(Method::GET)
+            .uri("http://example.com")
+            .header("proxy-authorization", format!("Basic {encoded}"))
+            .body(Body::empty())
+            .unwrap();
+        assert_eq!(
+            request_network_attempt_id(&req),
+            Some("attempt-1".to_string())
+        );
+    }
+
+    #[test]
+    fn request_network_attempt_id_reads_authorization_header_fallback() {
+        let encoded = STANDARD.encode("codex-net-attempt-attempt-2:");
+        let req = Request::builder()
+            .method(Method::GET)
+            .uri("http://example.com")
+            .header("authorization", format!("Basic {encoded}"))
+            .body(Body::empty())
+            .unwrap();
+        assert_eq!(
+            request_network_attempt_id(&req),
+            Some("attempt-2".to_string())
         );
     }
 }

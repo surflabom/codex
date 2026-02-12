@@ -4,30 +4,24 @@ use std::time::Duration;
 use async_trait::async_trait;
 use codex_async_utils::CancelErr;
 use codex_async_utils::OrCancelExt;
-use codex_protocol::approvals::NetworkApprovalContext;
 use codex_protocol::user_input::UserInput;
 use tokio_util::sync::CancellationToken;
-use tracing::debug;
 use tracing::error;
-use tracing::warn;
 use uuid::Uuid;
 
+use crate::codex::NetworkApprovalOutcome;
 use crate::codex::TurnContext;
-use crate::error::CodexErr;
-use crate::error::SandboxErr;
 use crate::exec::ExecToolCallOutput;
 use crate::exec::SandboxType;
 use crate::exec::StdoutStream;
 use crate::exec::StreamOutput;
 use crate::exec::execute_exec_env;
 use crate::exec_env::create_env;
-use crate::network_policy_decision::network_approval_context_from_payload;
 use crate::parse_command::parse_command;
 use crate::protocol::EventMsg;
 use crate::protocol::ExecCommandBeginEvent;
 use crate::protocol::ExecCommandEndEvent;
 use crate::protocol::ExecCommandSource;
-use crate::protocol::ReviewDecision;
 use crate::protocol::TurnStartedEvent;
 use crate::sandboxing::ExecRequest;
 use crate::sandboxing::SandboxPermissions;
@@ -148,77 +142,138 @@ pub(crate) async fn execute_user_shell_command(
         .await;
 
     let sandbox_policy = turn_context.sandbox_policy.clone();
-    let mut retried_after_network_approval = false;
-    let mut retry_network_context: Option<NetworkApprovalContext> = None;
+    let network_attempt_id = turn_context
+        .network
+        .as_ref()
+        .map(|_| Uuid::new_v4().to_string());
+    if let Some(attempt_id) = network_attempt_id.as_ref() {
+        session
+            .register_network_approval_attempt(
+                attempt_id.clone(),
+                turn_context.sub_id.clone(),
+                call_id.clone(),
+                display_command.clone(),
+                cwd.clone(),
+            )
+            .await;
+    }
 
-    loop {
-        let temporary_allowed_host = if let Some(network_context) = retry_network_context.take() {
-            if let Some(network) = turn_context.network.as_ref() {
-                let granted_host = network
-                    .grant_temporary_allowed_host(&network_context.host)
-                    .await;
-                if granted_host.is_none() {
-                    warn!(
-                        host = %network_context.host,
-                        "failed to grant temporary network host allowance for user shell retry"
-                    );
-                }
-                granted_host.map(|host| (network.clone(), host))
-            } else {
-                warn!(
-                    host = %network_context.host,
-                    "network approval context is present but no managed network proxy is available for user shell retry"
-                );
-                None
-            }
-        } else {
-            None
-        };
+    let exec_result = execute_exec_env(
+        ExecRequest {
+            command: exec_command.clone(),
+            cwd: cwd.clone(),
+            env: create_env(
+                &turn_context.shell_environment_policy,
+                Some(session.conversation_id),
+            ),
+            network: turn_context.network.clone(),
+            network_attempt_id: network_attempt_id.clone(),
+            // TODO(zhao-oai): Now that we have ExecExpiration::Cancellation, we
+            // should use that instead of an "arbitrarily large" timeout here.
+            expiration: USER_SHELL_TIMEOUT_MS.into(),
+            sandbox: SandboxType::None,
+            windows_sandbox_level: turn_context.windows_sandbox_level,
+            sandbox_permissions: SandboxPermissions::UseDefault,
+            justification: None,
+            arg0: None,
+        },
+        &sandbox_policy,
+        Some(StdoutStream {
+            sub_id: turn_context.sub_id.clone(),
+            call_id: call_id.clone(),
+            tx_event: session.get_tx_event(),
+        }),
+    )
+    .or_cancel(&cancellation_token)
+    .await;
 
-        let exec_result = execute_exec_env(
-            ExecRequest {
-                command: exec_command.clone(),
-                cwd: cwd.clone(),
-                env: create_env(
-                    &turn_context.shell_environment_policy,
-                    Some(session.conversation_id),
-                ),
-                network: turn_context.network.clone(),
-                network_attempt_id: None,
-                // TODO(zhao-oai): Now that we have ExecExpiration::Cancellation, we
-                // should use that instead of an "arbitrarily large" timeout here.
-                expiration: USER_SHELL_TIMEOUT_MS.into(),
-                sandbox: SandboxType::None,
-                windows_sandbox_level: turn_context.windows_sandbox_level,
-                sandbox_permissions: SandboxPermissions::UseDefault,
-                justification: None,
-                arg0: None,
-            },
-            &sandbox_policy,
-            Some(StdoutStream {
-                sub_id: turn_context.sub_id.clone(),
-                call_id: call_id.clone(),
-                tx_event: session.get_tx_event(),
-            }),
-        )
-        .or_cancel(&cancellation_token)
-        .await;
+    let approval_outcome = if let Some(attempt_id) = network_attempt_id.as_deref() {
+        session.take_network_approval_outcome(attempt_id).await
+    } else {
+        None
+    };
+    if let Some(attempt_id) = network_attempt_id.as_deref() {
+        session
+            .unregister_network_approval_attempt(attempt_id)
+            .await;
+    }
 
-        if let Some((network, host)) = temporary_allowed_host {
-            network.revoke_temporary_allowed_host(&host).await;
+    match exec_result {
+        Err(CancelErr::Cancelled) => {
+            let aborted_message = "command aborted by user".to_string();
+            let exec_output = ExecToolCallOutput {
+                exit_code: -1,
+                stdout: StreamOutput::new(String::new()),
+                stderr: StreamOutput::new(aborted_message.clone()),
+                aggregated_output: StreamOutput::new(aborted_message.clone()),
+                duration: Duration::ZERO,
+                timed_out: false,
+            };
+            persist_user_shell_output(
+                &session,
+                turn_context.as_ref(),
+                &raw_command,
+                &exec_output,
+                mode,
+            )
+            .await;
+            session
+                .send_event(
+                    turn_context.as_ref(),
+                    EventMsg::ExecCommandEnd(ExecCommandEndEvent {
+                        call_id,
+                        process_id: None,
+                        turn_id: turn_context.sub_id.clone(),
+                        command: display_command.clone(),
+                        cwd: cwd.clone(),
+                        parsed_cmd: parsed_cmd.clone(),
+                        source: ExecCommandSource::UserShell,
+                        interaction_input: None,
+                        stdout: String::new(),
+                        stderr: aborted_message.clone(),
+                        aggregated_output: aborted_message.clone(),
+                        exit_code: -1,
+                        duration: Duration::ZERO,
+                        formatted_output: aborted_message,
+                    }),
+                )
+                .await;
         }
-
-        match exec_result {
-            Err(CancelErr::Cancelled) => {
-                let aborted_message = "command aborted by user".to_string();
+        Ok(Ok(output)) => {
+            if approval_outcome == Some(NetworkApprovalOutcome::DeniedByUser) {
+                let message = "execution error: rejected by user".to_string();
                 let exec_output = ExecToolCallOutput {
                     exit_code: -1,
                     stdout: StreamOutput::new(String::new()),
-                    stderr: StreamOutput::new(aborted_message.clone()),
-                    aggregated_output: StreamOutput::new(aborted_message.clone()),
+                    stderr: StreamOutput::new(message.clone()),
+                    aggregated_output: StreamOutput::new(message.clone()),
                     duration: Duration::ZERO,
                     timed_out: false,
                 };
+                session
+                    .send_event(
+                        turn_context.as_ref(),
+                        EventMsg::ExecCommandEnd(ExecCommandEndEvent {
+                            call_id: call_id.clone(),
+                            process_id: None,
+                            turn_id: turn_context.sub_id.clone(),
+                            command: display_command.clone(),
+                            cwd: cwd.clone(),
+                            parsed_cmd: parsed_cmd.clone(),
+                            source: ExecCommandSource::UserShell,
+                            interaction_input: None,
+                            stdout: exec_output.stdout.text.clone(),
+                            stderr: exec_output.stderr.text.clone(),
+                            aggregated_output: exec_output.aggregated_output.text.clone(),
+                            exit_code: exec_output.exit_code,
+                            duration: exec_output.duration,
+                            formatted_output: format_exec_output_str(
+                                &exec_output,
+                                turn_context.truncation_policy,
+                            ),
+                        }),
+                    )
+                    .await;
                 persist_user_shell_output(
                     &session,
                     turn_context.as_ref(),
@@ -227,30 +282,7 @@ pub(crate) async fn execute_user_shell_command(
                     mode,
                 )
                 .await;
-                session
-                    .send_event(
-                        turn_context.as_ref(),
-                        EventMsg::ExecCommandEnd(ExecCommandEndEvent {
-                            call_id,
-                            process_id: None,
-                            turn_id: turn_context.sub_id.clone(),
-                            command: display_command.clone(),
-                            cwd: cwd.clone(),
-                            parsed_cmd: parsed_cmd.clone(),
-                            source: ExecCommandSource::UserShell,
-                            interaction_input: None,
-                            stdout: String::new(),
-                            stderr: aborted_message.clone(),
-                            aggregated_output: aborted_message.clone(),
-                            exit_code: -1,
-                            duration: Duration::ZERO,
-                            formatted_output: aborted_message,
-                        }),
-                    )
-                    .await;
-                return;
-            }
-            Ok(Ok(output)) => {
+            } else {
                 session
                     .send_event(
                         turn_context.as_ref(),
@@ -275,7 +307,6 @@ pub(crate) async fn execute_user_shell_command(
                         }),
                     )
                     .await;
-
                 persist_user_shell_output(
                     &session,
                     turn_context.as_ref(),
@@ -284,120 +315,55 @@ pub(crate) async fn execute_user_shell_command(
                     mode,
                 )
                 .await;
-                return;
             }
-            Ok(Err(err)) => {
-                if !retried_after_network_approval
-                    && let CodexErr::Sandbox(SandboxErr::Denied {
-                        network_policy_decision,
-                        ..
-                    }) = &err
-                {
-                    if let Some(payload) = network_policy_decision.as_ref() {
-                        debug!(
-                            "user shell received structured network decision on sandbox deny (decision={}, source={}, host={:?}, protocol={:?}, port={:?})",
-                            payload.decision,
-                            payload.source,
-                            payload.host,
-                            payload.protocol,
-                            payload.port
-                        );
-                    } else {
-                        debug!(
-                            "user shell sandbox deny did not include structured network decision"
-                        );
-                    }
-                    let network_approval_context = network_policy_decision
-                        .as_ref()
-                        .and_then(network_approval_context_from_payload);
-
-                    if let Some(network_approval_context) = network_approval_context {
-                        debug!(
-                            "user shell requesting network approval for host {}",
-                            network_approval_context.host
-                        );
-                        let approval_decision = session
-                            .request_command_approval(
-                                turn_context.as_ref(),
-                                call_id.clone(),
-                                display_command.clone(),
-                                cwd.clone(),
-                                Some(format!(
-                                    "Network access to \"{}\" is blocked by policy.",
-                                    network_approval_context.host
-                                )),
-                                Some(network_approval_context.clone()),
-                                None,
-                            )
-                            .await;
-
-                        match approval_decision {
-                            ReviewDecision::Approved
-                            | ReviewDecision::ApprovedExecpolicyAmendment { .. }
-                            | ReviewDecision::ApprovedForSession => {
-                                debug!(
-                                    "user shell network approval granted for host {}",
-                                    network_approval_context.host
-                                );
-                                retried_after_network_approval = true;
-                                retry_network_context = Some(network_approval_context);
-                                continue;
-                            }
-                            ReviewDecision::Denied | ReviewDecision::Abort => {
-                                debug!("user shell network approval denied by user");
-                            }
-                        }
-                    } else if network_policy_decision.is_some() {
-                        debug!(
-                            "user shell could not derive network approval context from structured decision payload"
-                        );
-                    }
-                }
-
-                error!("user shell command failed: {err:?}");
-                let message = format!("execution error: {err:?}");
-                let exec_output = ExecToolCallOutput {
-                    exit_code: -1,
-                    stdout: StreamOutput::new(String::new()),
-                    stderr: StreamOutput::new(message.clone()),
-                    aggregated_output: StreamOutput::new(message.clone()),
-                    duration: Duration::ZERO,
-                    timed_out: false,
-                };
-                session
-                    .send_event(
-                        turn_context.as_ref(),
-                        EventMsg::ExecCommandEnd(ExecCommandEndEvent {
-                            call_id,
-                            process_id: None,
-                            turn_id: turn_context.sub_id.clone(),
-                            command: display_command,
-                            cwd,
-                            parsed_cmd,
-                            source: ExecCommandSource::UserShell,
-                            interaction_input: None,
-                            stdout: exec_output.stdout.text.clone(),
-                            stderr: exec_output.stderr.text.clone(),
-                            aggregated_output: exec_output.aggregated_output.text.clone(),
-                            exit_code: exec_output.exit_code,
-                            duration: exec_output.duration,
-                            formatted_output: format_exec_output_str(
-                                &exec_output,
-                                turn_context.truncation_policy,
-                            ),
-                        }),
-                    )
-                    .await;
-                persist_user_shell_output(
-                    &session,
+        }
+        Ok(Err(err)) => {
+            error!("user shell command failed: {err:?}");
+            let message = if approval_outcome == Some(NetworkApprovalOutcome::DeniedByUser) {
+                "execution error: rejected by user".to_string()
+            } else {
+                format!("execution error: {err:?}")
+            };
+            let exec_output = ExecToolCallOutput {
+                exit_code: -1,
+                stdout: StreamOutput::new(String::new()),
+                stderr: StreamOutput::new(message.clone()),
+                aggregated_output: StreamOutput::new(message.clone()),
+                duration: Duration::ZERO,
+                timed_out: false,
+            };
+            session
+                .send_event(
                     turn_context.as_ref(),
-                    &raw_command,
-                    &exec_output,
-                    mode,
+                    EventMsg::ExecCommandEnd(ExecCommandEndEvent {
+                        call_id,
+                        process_id: None,
+                        turn_id: turn_context.sub_id.clone(),
+                        command: display_command,
+                        cwd,
+                        parsed_cmd,
+                        source: ExecCommandSource::UserShell,
+                        interaction_input: None,
+                        stdout: exec_output.stdout.text.clone(),
+                        stderr: exec_output.stderr.text.clone(),
+                        aggregated_output: exec_output.aggregated_output.text.clone(),
+                        exit_code: exec_output.exit_code,
+                        duration: exec_output.duration,
+                        formatted_output: format_exec_output_str(
+                            &exec_output,
+                            turn_context.truncation_policy,
+                        ),
+                    }),
                 )
                 .await;
-                return;
-            }
+            persist_user_shell_output(
+                &session,
+                turn_context.as_ref(),
+                &raw_command,
+                &exec_output,
+                mode,
+            )
+            .await;
         }
     }
 }
