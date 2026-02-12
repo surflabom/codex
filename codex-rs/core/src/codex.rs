@@ -4380,6 +4380,12 @@ async fn run_pre_sampling_compact(
     Ok(())
 }
 
+/// Runs pre-sampling auto-compaction against the previous model when switching to a smaller
+/// context window model.
+///
+/// Returns `Ok(true)` only when previous-model compaction actually ran; callers use this to gate
+/// post-compaction actions (for example switching session base instructions to the turn model).
+/// Returns `Ok(false)` when compaction is skipped due to unmet preconditions.
 async fn maybe_run_previous_model_inline_compact(
     sess: &Arc<Session>,
     turn_context: &Arc<TurnContext>,
