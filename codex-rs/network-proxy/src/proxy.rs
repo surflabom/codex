@@ -360,7 +360,12 @@ fn apply_proxy_env_overrides(
 
     env.insert("ELECTRON_GET_USE_PROXY".to_string(), "true".to_string());
 
-    if socks_enabled {
+    // Keep HTTP_PROXY/HTTPS_PROXY as HTTP endpoints. A lot of clients break if
+    // those vars contain SOCKS URLs. We only switch ALL_PROXY here.
+    //
+    // For attempt-scoped runs, point ALL_PROXY at the HTTP proxy URL so the
+    // attempt metadata survives in proxy credentials for correlation.
+    if socks_enabled && network_attempt_id.is_none() {
         set_env_keys(env, ALL_PROXY_ENV_KEYS, &socks_proxy_url);
         set_env_keys(env, FTP_PROXY_ENV_KEYS, &socks_proxy_url);
         #[cfg(target_os = "macos")]
@@ -372,6 +377,7 @@ fn apply_proxy_env_overrides(
         }
     } else {
         set_env_keys(env, ALL_PROXY_ENV_KEYS, &http_proxy_url);
+        set_env_keys(env, FTP_PROXY_ENV_KEYS, &http_proxy_url);
     }
 }
 
@@ -816,6 +822,10 @@ mod tests {
         );
         assert_eq!(
             env.get("HTTPS_PROXY"),
+            Some(&"http://codex-net-attempt-attempt-123@127.0.0.1:3128".to_string())
+        );
+        assert_eq!(
+            env.get("ALL_PROXY"),
             Some(&"http://codex-net-attempt-attempt-123@127.0.0.1:3128".to_string())
         );
     }
