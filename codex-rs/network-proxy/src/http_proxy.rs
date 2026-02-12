@@ -652,40 +652,30 @@ fn request_network_attempt_id(req: &Request) -> Option<String> {
 }
 
 fn remove_hop_by_hop_request_headers(headers: &mut HeaderMap) {
-    while let Some(raw_connection) = headers.get(header::CONNECTION) {
-        let Some(raw_connection) = raw_connection.to_str().ok() else {
-            break;
-        };
-        let connection_headers: Vec<String> = raw_connection
-            .split(',')
-            .map(str::trim)
-            .filter(|token| !token.is_empty())
-            .map(ToOwned::to_owned)
-            .collect();
+    while let Some(raw_connection) = headers.get(header::CONNECTION).cloned() {
         headers.remove(header::CONNECTION);
-        for token in connection_headers {
-            if let Ok(name) = HeaderName::from_bytes(token.as_bytes()) {
-                headers.remove(name);
+        if let Ok(raw_connection) = raw_connection.to_str() {
+            let connection_headers: Vec<String> = raw_connection
+                .split(',')
+                .map(str::trim)
+                .filter(|token| !token.is_empty())
+                .map(ToOwned::to_owned)
+                .collect();
+            for token in connection_headers {
+                if let Ok(name) = HeaderName::from_bytes(token.as_bytes()) {
+                    headers.remove(name);
+                }
             }
         }
     }
     for name in [
+        &header::KEEP_ALIVE,
         &header::PROXY_CONNECTION,
         &header::PROXY_AUTHORIZATION,
         &header::TE,
         &header::TRAILER,
         &header::TRANSFER_ENCODING,
         &header::UPGRADE,
-        &header::X_FORWARDED_FOR,
-        &header::X_FORWARDED_HOST,
-        &header::X_FORWARDED_PROTO,
-        &header::FORWARDED,
-        &header::VIA,
-        &header::CF_CONNECTING_IP,
-        &header::X_REAL_IP,
-        &header::X_CLIENT_IP,
-        &header::CLIENT_IP,
-        &header::TRUE_CLIENT_IP,
     ] {
         headers.remove(name);
     }
@@ -864,7 +854,7 @@ mod tests {
     }
 
     #[test]
-    fn remove_hop_by_hop_request_headers_strips_proxy_auth_and_connection_tokens() {
+    fn remove_hop_by_hop_request_headers_keeps_forwarding_headers() {
         let mut headers = HeaderMap::new();
         headers.insert(
             header::CONNECTION,
@@ -886,7 +876,10 @@ mod tests {
         assert_eq!(headers.get(header::CONNECTION), None);
         assert_eq!(headers.get("x-hop"), None);
         assert_eq!(headers.get(header::PROXY_AUTHORIZATION), None);
-        assert_eq!(headers.get(&header::X_FORWARDED_FOR), None);
+        assert_eq!(
+            headers.get(&header::X_FORWARDED_FOR),
+            Some(&HeaderValue::from_static("127.0.0.1"))
+        );
         assert_eq!(
             headers.get(header::HOST),
             Some(&HeaderValue::from_static("example.com"))
