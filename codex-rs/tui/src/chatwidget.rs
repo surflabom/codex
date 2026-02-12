@@ -49,6 +49,7 @@ use codex_app_server_protocol::ConfigLayerSource;
 use codex_backend_client::Client as BackendClient;
 use codex_chatgpt::connectors;
 use codex_core::config::Config;
+use codex_core::config::ConfigToml;
 use codex_core::config::ConstraintResult;
 use codex_core::config::types::Notifications;
 use codex_core::config::types::WindowsSandboxModeToml;
@@ -121,6 +122,7 @@ use codex_protocol::config_types::CollaborationMode;
 use codex_protocol::config_types::CollaborationModeMask;
 use codex_protocol::config_types::ModeKind;
 use codex_protocol::config_types::Personality;
+use codex_protocol::config_types::SandboxMode;
 use codex_protocol::config_types::Settings;
 #[cfg(target_os = "windows")]
 use codex_protocol::config_types::WindowsSandboxLevel;
@@ -5253,6 +5255,7 @@ impl ChatWidget {
         let current_sandbox = self.config.sandbox_policy.get();
         let mut items: Vec<SelectionItem> = Vec::new();
         let presets: Vec<ApprovalPreset> = builtin_approval_presets();
+        let custom_config_permissions = Self::custom_permissions_from_user_config(&self.config);
 
         #[cfg(target_os = "windows")]
         let windows_sandbox_level = WindowsSandboxLevel::from_config(&self.config);
@@ -5355,6 +5358,23 @@ impl ChatWidget {
             });
         }
 
+        if let Some((approval, sandbox)) = custom_config_permissions {
+            let is_current = current_approval == approval && *current_sandbox == sandbox;
+            let disabled_reason = match self.config.approval_policy.can_set(&approval) {
+                Ok(()) => None,
+                Err(err) => Some(err.to_string()),
+            };
+            items.push(SelectionItem {
+                name: "Custom".to_string(),
+                description: crate::status::custom_permissions_details(approval, &sandbox),
+                is_current,
+                actions: Self::approval_preset_actions(approval, sandbox),
+                dismiss_on_select: true,
+                disabled_reason,
+                ..Default::default()
+            });
+        }
+
         let footer_note = show_elevate_sandbox_hint.then(|| {
             vec![
                 "The non-admin sandbox protects your files and prevents network access under most circumstances. However, it carries greater risk if prompt injected. To upgrade to the default sandbox, run ".dim(),
@@ -5421,6 +5441,49 @@ impl ChatWidget {
         preset: &ApprovalPreset,
     ) -> bool {
         current_approval == preset.approval && *current_sandbox == preset.sandbox
+    }
+
+    fn custom_permissions_from_user_config(
+        config: &Config,
+    ) -> Option<(AskForApproval, SandboxPolicy)> {
+        let user_layer = config.config_layer_stack.get_user_layer()?;
+        let config_toml: ConfigToml = user_layer.config.clone().try_into().ok()?;
+        let profile = config_toml
+            .get_config_profile(config.active_profile.clone())
+            .ok()?;
+        let approval_explicit =
+            profile.approval_policy.is_some() || config_toml.approval_policy.is_some();
+        let sandbox_mode_explicit =
+            profile.sandbox_mode.is_some() || config_toml.sandbox_mode.is_some();
+        let sandbox_workspace_write_explicit = config_toml.sandbox_workspace_write.is_some();
+        if !approval_explicit && !sandbox_mode_explicit && !sandbox_workspace_write_explicit {
+            return None;
+        }
+
+        let approval = profile
+            .approval_policy
+            .or(config_toml.approval_policy)
+            .unwrap_or_default();
+        let sandbox_mode = profile
+            .sandbox_mode
+            .or(config_toml.sandbox_mode)
+            .unwrap_or(SandboxMode::WorkspaceWrite);
+        let sandbox = match sandbox_mode {
+            SandboxMode::ReadOnly => SandboxPolicy::new_read_only_policy(),
+            SandboxMode::WorkspaceWrite => match config_toml.sandbox_workspace_write {
+                Some(settings) => SandboxPolicy::WorkspaceWrite {
+                    writable_roots: settings.writable_roots,
+                    read_only_access: Default::default(),
+                    network_access: settings.network_access,
+                    exclude_tmpdir_env_var: settings.exclude_tmpdir_env_var,
+                    exclude_slash_tmp: settings.exclude_slash_tmp,
+                },
+                None => SandboxPolicy::new_workspace_write_policy(),
+            },
+            SandboxMode::DangerFullAccess => SandboxPolicy::DangerFullAccess,
+        };
+        crate::status::custom_permissions_details(approval, &sandbox)?;
+        Some((approval, sandbox))
     }
 
     #[cfg(target_os = "windows")]
