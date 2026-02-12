@@ -36,11 +36,13 @@ use rama_core::layer::AddInputExtensionLayer;
 use rama_core::rt::Executor;
 use rama_core::service::service_fn;
 use rama_http::Body;
+use rama_http::HeaderMap;
+use rama_http::HeaderName;
 use rama_http::HeaderValue;
 use rama_http::Request;
 use rama_http::Response;
 use rama_http::StatusCode;
-use rama_http::layer::remove_header::RemoveRequestHeaderLayer;
+use rama_http::header;
 use rama_http::layer::remove_header::RemoveResponseHeaderLayer;
 use rama_http::matcher::MethodMatcher;
 use rama_http_backend::client::proxy::layer::HttpProxyConnector;
@@ -119,7 +121,6 @@ async fn run_http_proxy_with_listener(
                 service_fn(http_connect_proxy),
             ),
             RemoveResponseHeaderLayer::hop_by_hop(),
-            RemoveRequestHeaderLayer::hop_by_hop(),
         )
             .into_layer(service_fn({
                 let policy_decider = policy_decider.clone();
@@ -363,7 +364,7 @@ async fn forward_connect_tunnel(
 
 async fn http_plain_proxy(
     policy_decider: Option<Arc<dyn NetworkPolicyDecider>>,
-    req: Request,
+    mut req: Request,
 ) -> Result<Response, Infallible> {
     let app_state = match req.extensions().get::<Arc<NetworkProxyState>>().cloned() {
         Some(state) => state,
@@ -598,6 +599,7 @@ async fn http_plain_proxy(
         UpstreamClient::direct()
     };
 
+    remove_hop_by_hop_request_headers(req.headers_mut());
     match client.serve(req).await {
         Ok(resp) => Ok(resp),
         Err(err) => {
@@ -622,6 +624,7 @@ async fn proxy_via_unix_socket(req: Request, socket_path: &str) -> Result<Respon
             .parse()
             .with_context(|| format!("invalid unix socket request path: {path}"))?;
         parts.headers.remove("x-unix-socket");
+        remove_hop_by_hop_request_headers(&mut parts.headers);
 
         let req = Request::from_parts(parts, body);
         client.serve(req).await.map_err(anyhow::Error::from)
@@ -645,6 +648,46 @@ fn request_network_attempt_id(req: &Request) -> Option<String> {
     // Some HTTP stacks normalize proxy credentials into `authorization`; accept both.
     attempt_id_from_proxy_authorization(req.headers().get("proxy-authorization"))
         .or_else(|| attempt_id_from_proxy_authorization(req.headers().get("authorization")))
+}
+
+fn remove_hop_by_hop_request_headers(headers: &mut HeaderMap) {
+    while let Some(raw_connection) = headers.get(header::CONNECTION) {
+        let Some(raw_connection) = raw_connection.to_str().ok() else {
+            break;
+        };
+        let connection_headers: Vec<String> = raw_connection
+            .split(',')
+            .map(str::trim)
+            .filter(|token| !token.is_empty())
+            .map(ToOwned::to_owned)
+            .collect();
+        headers.remove(header::CONNECTION);
+        for token in connection_headers {
+            if let Ok(name) = HeaderName::from_bytes(token.as_bytes()) {
+                headers.remove(name);
+            }
+        }
+    }
+    for name in [
+        &header::PROXY_CONNECTION,
+        &header::PROXY_AUTHORIZATION,
+        &header::TE,
+        &header::TRAILER,
+        &header::TRANSFER_ENCODING,
+        &header::UPGRADE,
+        &header::X_FORWARDED_FOR,
+        &header::X_FORWARDED_HOST,
+        &header::X_FORWARDED_PROTO,
+        &header::FORWARDED,
+        &header::VIA,
+        &header::CF_CONNECTING_IP,
+        &header::X_REAL_IP,
+        &header::X_CLIENT_IP,
+        &header::CLIENT_IP,
+        &header::TRUE_CLIENT_IP,
+    ] {
+        headers.remove(name);
+    }
 }
 
 fn json_blocked(host: &str, reason: &str, details: Option<&PolicyDecisionDetails<'_>>) -> Response {
@@ -816,6 +859,36 @@ mod tests {
         assert_eq!(
             request_network_attempt_id(&req),
             Some("attempt-2".to_string())
+        );
+    }
+
+    #[test]
+    fn remove_hop_by_hop_request_headers_strips_proxy_auth_and_connection_tokens() {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            header::CONNECTION,
+            HeaderValue::from_static("x-hop, keep-alive"),
+        );
+        headers.insert("x-hop", HeaderValue::from_static("1"));
+        headers.insert(
+            header::PROXY_AUTHORIZATION,
+            HeaderValue::from_static("Basic abc"),
+        );
+        headers.insert(
+            &header::X_FORWARDED_FOR,
+            HeaderValue::from_static("127.0.0.1"),
+        );
+        headers.insert(header::HOST, HeaderValue::from_static("example.com"));
+
+        remove_hop_by_hop_request_headers(&mut headers);
+
+        assert_eq!(headers.get(header::CONNECTION), None);
+        assert_eq!(headers.get("x-hop"), None);
+        assert_eq!(headers.get(header::PROXY_AUTHORIZATION), None);
+        assert_eq!(headers.get(&header::X_FORWARDED_FOR), None);
+        assert_eq!(
+            headers.get(header::HOST),
+            Some(&HeaderValue::from_static("example.com"))
         );
     }
 }
