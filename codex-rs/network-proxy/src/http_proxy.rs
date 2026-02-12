@@ -599,6 +599,7 @@ async fn http_plain_proxy(
         UpstreamClient::direct()
     };
 
+    // Strip hop-by-hop headers only after extracting metadata used for policy correlation.
     remove_hop_by_hop_request_headers(req.headers_mut());
     match client.serve(req).await {
         Ok(resp) => Ok(resp),
