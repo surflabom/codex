@@ -395,12 +395,9 @@ pub(crate) fn custom_permissions_details(
     approval: AskForApproval,
     sandbox_policy: &SandboxPolicy,
 ) -> Option<String> {
-    if approval == AskForApproval::OnRequest
-        && *sandbox_policy == SandboxPolicy::new_workspace_write_policy()
-    {
-        None
-    } else if approval == AskForApproval::Never
-        && *sandbox_policy == SandboxPolicy::DangerFullAccess
+    if (approval == AskForApproval::OnRequest
+        && *sandbox_policy == SandboxPolicy::new_workspace_write_policy())
+        || (approval == AskForApproval::Never && *sandbox_policy == SandboxPolicy::DangerFullAccess)
     {
         None
     } else {
