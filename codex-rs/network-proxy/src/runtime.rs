@@ -36,6 +36,7 @@ use tracing::warn;
 
 const MAX_BLOCKED_EVENTS: usize = 200;
 const DNS_LOOKUP_TIMEOUT: Duration = Duration::from_secs(2);
+const NETWORK_POLICY_VIOLATION_PREFIX: &str = "CODEX_NETWORK_POLICY_VIOLATION";
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum HostBlockReason {
@@ -124,6 +125,19 @@ impl BlockedRequest {
             source,
             port,
             timestamp: unix_timestamp(),
+        }
+    }
+}
+
+fn blocked_request_violation_log_line(entry: &BlockedRequest) -> String {
+    match serde_json::to_string(entry) {
+        Ok(json) => format!("{NETWORK_POLICY_VIOLATION_PREFIX} {json}"),
+        Err(err) => {
+            warn!("failed to serialize blocked request for violation log: {err}");
+            format!(
+                "{NETWORK_POLICY_VIOLATION_PREFIX} host={} reason={}",
+                entry.host, entry.reason
+            )
         }
     }
 }
@@ -334,6 +348,7 @@ impl NetworkProxyState {
 
     pub async fn record_blocked(&self, entry: BlockedRequest) -> Result<()> {
         self.reload_if_needed().await?;
+        let violation_line = blocked_request_violation_log_line(&entry);
         let mut guard = self.state.write().await;
         let host = entry.host.clone();
         let reason = entry.reason.clone();
@@ -360,6 +375,7 @@ impl NetworkProxyState {
             attempt_id,
             guard.blocked.len()
         );
+        warn!("{violation_line}");
         Ok(())
     }
 
@@ -908,6 +924,28 @@ mod tests {
             .expect("blocked_since should succeed");
         assert_eq!(blocked.len(), MAX_BLOCKED_EVENTS);
         assert_eq!(blocked[0].host, "example5.com");
+    }
+
+    #[test]
+    fn blocked_request_violation_log_line_serializes_payload() {
+        let entry = BlockedRequest {
+            host: "google.com".to_string(),
+            reason: "not_allowed".to_string(),
+            client: Some("127.0.0.1".to_string()),
+            method: Some("GET".to_string()),
+            mode: Some(NetworkMode::Full),
+            protocol: "http".to_string(),
+            attempt_id: Some("attempt-1".to_string()),
+            decision: Some("ask".to_string()),
+            source: Some("decider".to_string()),
+            port: Some(80),
+            timestamp: 1_735_689_600,
+        };
+
+        assert_eq!(
+            blocked_request_violation_log_line(&entry),
+            r#"CODEX_NETWORK_POLICY_VIOLATION {"host":"google.com","reason":"not_allowed","client":"127.0.0.1","method":"GET","mode":"full","protocol":"http","attempt_id":"attempt-1","decision":"ask","source":"decider","port":80,"timestamp":1735689600}"#
+        );
     }
 
     #[tokio::test]
