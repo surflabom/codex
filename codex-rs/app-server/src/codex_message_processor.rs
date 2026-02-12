@@ -4300,9 +4300,9 @@ impl CodexMessageProcessor {
             }
         };
 
-        let status = if let Some(thread) = self.thread_manager.remove_thread(&thread_id).await {
-            info!("thread {thread_id} was active; shutting down");
-            let status = match thread.submit(Op::Shutdown).await {
+        let status = if let Ok(thread) = self.thread_manager.get_thread(thread_id).await {
+            info!("thread {thread_id} is loaded; shutting down");
+            match thread.submit(Op::Shutdown).await {
                 Ok(_) => {
                     let wait_for_shutdown = async {
                         loop {
@@ -4316,35 +4316,41 @@ impl CodexMessageProcessor {
                         .await
                         .is_err()
                     {
-                        warn!("thread {thread_id} shutdown timed out; proceeding with close");
+                        warn!("thread {thread_id} shutdown timed out; leaving thread loaded");
                         ThreadCloseStatus::ShutdownTimedOut
                     } else {
-                        ThreadCloseStatus::Closed
+                        let removed_thread = self.thread_manager.remove_thread(&thread_id).await;
+                        if removed_thread.is_some() {
+                            self.thread_state_manager
+                                .remove_thread_state(thread_id)
+                                .await;
+                            let notification = ThreadClosedNotification {
+                                thread_id: thread_id.to_string(),
+                            };
+                            self.outgoing
+                                .send_server_notification(ServerNotification::ThreadClosed(
+                                    notification,
+                                ))
+                                .await;
+                            ThreadCloseStatus::Closed
+                        } else {
+                            info!("thread {thread_id} was already removed before close finalized");
+                            ThreadCloseStatus::NotLoaded
+                        }
                     }
                 }
                 Err(err) => {
                     warn!("failed to submit Shutdown to thread {thread_id}: {err}");
                     ThreadCloseStatus::ShutdownSubmitFailed
                 }
-            };
-
-            if matches!(status, ThreadCloseStatus::Closed) {
-                let notification = ThreadClosedNotification {
-                    thread_id: thread_id.to_string(),
-                };
-                self.outgoing
-                    .send_server_notification(ServerNotification::ThreadClosed(notification))
-                    .await;
             }
-
-            status
         } else {
+            self.thread_state_manager
+                .remove_thread_state(thread_id)
+                .await;
             ThreadCloseStatus::NotLoaded
         };
 
-        self.thread_state_manager
-            .remove_thread_state(thread_id)
-            .await;
         self.outgoing
             .send_response(request_id, ThreadCloseResponse { status })
             .await;
