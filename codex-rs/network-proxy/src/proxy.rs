@@ -1,4 +1,5 @@
 use crate::admin;
+use crate::attempt_metadata::proxy_username_for_attempt_id;
 use crate::config;
 use crate::http_proxy;
 use crate::network_policy::NetworkPolicyDecider;
@@ -313,8 +314,12 @@ fn apply_proxy_env_overrides(
     socks_addr: SocketAddr,
     socks_enabled: bool,
     allow_local_binding: bool,
+    network_attempt_id: Option<&str>,
 ) {
-    let http_proxy_url = format!("http://{http_addr}");
+    let http_proxy_url = network_attempt_id
+        .map(proxy_username_for_attempt_id)
+        .map(|username| format!("http://{username}@{http_addr}"))
+        .unwrap_or_else(|| format!("http://{http_addr}"));
     let socks_proxy_url = format!("socks5h://{socks_addr}");
     env.insert(
         ALLOW_LOCAL_BINDING_ENV_KEY.to_string(),
@@ -416,7 +421,22 @@ impl NetworkProxy {
         self.state.blocked_since(cursor).await
     }
 
+    pub async fn latest_blocked_request_for_attempt(
+        &self,
+        attempt_id: &str,
+    ) -> Result<Option<BlockedRequest>> {
+        self.state.latest_blocked_for_attempt(attempt_id).await
+    }
+
     pub fn apply_to_env(&self, env: &mut HashMap<String, String>) {
+        self.apply_to_env_for_attempt(env, None);
+    }
+
+    pub fn apply_to_env_for_attempt(
+        &self,
+        env: &mut HashMap<String, String>,
+        network_attempt_id: Option<&str>,
+    ) {
         // Enforce proxying for child processes. We intentionally override existing values so
         // command-level environment cannot bypass the managed proxy endpoint.
         apply_proxy_env_overrides(
@@ -425,6 +445,7 @@ impl NetworkProxy {
             self.socks_addr,
             self.socks_enabled,
             self.allow_local_binding,
+            network_attempt_id,
         );
     }
 
@@ -724,6 +745,7 @@ mod tests {
             SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 8081),
             true,
             false,
+            None,
         );
 
         assert_eq!(
@@ -766,6 +788,7 @@ mod tests {
             SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 8081),
             false,
             true,
+            None,
         );
 
         assert_eq!(
@@ -773,6 +796,28 @@ mod tests {
             Some(&"http://127.0.0.1:3128".to_string())
         );
         assert_eq!(env.get(ALLOW_LOCAL_BINDING_ENV_KEY), Some(&"1".to_string()));
+    }
+
+    #[test]
+    fn apply_proxy_env_overrides_embeds_attempt_id_in_http_proxy_url() {
+        let mut env = HashMap::new();
+        apply_proxy_env_overrides(
+            &mut env,
+            SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 3128),
+            SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 8081),
+            true,
+            false,
+            Some("attempt-123"),
+        );
+
+        assert_eq!(
+            env.get("HTTP_PROXY"),
+            Some(&"http://codex-net-attempt-attempt-123@127.0.0.1:3128".to_string())
+        );
+        assert_eq!(
+            env.get("HTTPS_PROXY"),
+            Some(&"http://codex-net-attempt-attempt-123@127.0.0.1:3128".to_string())
+        );
     }
 
     #[cfg(target_os = "macos")]
@@ -789,6 +834,7 @@ mod tests {
             SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 8081),
             true,
             false,
+            None,
         );
 
         assert_eq!(

@@ -1,3 +1,4 @@
+use crate::attempt_metadata::attempt_id_from_proxy_authorization;
 use crate::config::NetworkMode;
 use crate::network_policy::NetworkDecision;
 use crate::network_policy::NetworkDecisionSource;
@@ -159,6 +160,7 @@ async fn http_connect_accept(
     }
 
     let client = client_addr(&req);
+    let network_attempt_id = request_network_attempt_id(&req);
 
     let enabled = app_state
         .enabled()
@@ -186,6 +188,7 @@ async fn http_connect_accept(
         method: Some("CONNECT".to_string()),
         command: None,
         exec_policy_hint: None,
+        attempt_id: network_attempt_id.clone(),
     });
 
     match evaluate_host_policy(&app_state, policy_decider.as_ref(), &request).await {
@@ -210,6 +213,7 @@ async fn http_connect_accept(
                     method: Some("CONNECT".to_string()),
                     mode: None,
                     protocol: "http-connect".to_string(),
+                    attempt_id: network_attempt_id.clone(),
                     decision: Some(details.decision.as_str().to_string()),
                     source: Some(details.source.as_str().to_string()),
                     port: Some(authority.port),
@@ -251,6 +255,7 @@ async fn http_connect_accept(
                 method: Some("CONNECT".to_string()),
                 mode: Some(NetworkMode::Limited),
                 protocol: "http-connect".to_string(),
+                attempt_id: network_attempt_id,
                 decision: Some(details.decision.as_str().to_string()),
                 source: Some(details.source.as_str().to_string()),
                 port: Some(authority.port),
@@ -369,6 +374,7 @@ async fn http_plain_proxy(
         }
     };
     let client = client_addr(&req);
+    let network_attempt_id = request_network_attempt_id(&req);
 
     let method_allowed = match app_state
         .method_allowed(req.method().as_str())
@@ -498,6 +504,7 @@ async fn http_plain_proxy(
         method: Some(req.method().as_str().to_string()),
         command: None,
         exec_policy_hint: None,
+        attempt_id: network_attempt_id.clone(),
     });
 
     match evaluate_host_policy(&app_state, policy_decider.as_ref(), &request).await {
@@ -522,6 +529,7 @@ async fn http_plain_proxy(
                     method: Some(req.method().as_str().to_string()),
                     mode: None,
                     protocol: "http".to_string(),
+                    attempt_id: network_attempt_id.clone(),
                     decision: Some(details.decision.as_str().to_string()),
                     source: Some(details.source.as_str().to_string()),
                     port: Some(port),
@@ -555,6 +563,7 @@ async fn http_plain_proxy(
                 method: Some(req.method().as_str().to_string()),
                 mode: Some(NetworkMode::Limited),
                 protocol: "http".to_string(),
+                attempt_id: network_attempt_id,
                 decision: Some(details.decision.as_str().to_string()),
                 source: Some(details.source.as_str().to_string()),
                 port: Some(port),
@@ -633,6 +642,10 @@ fn client_addr<T: ExtensionsRef>(input: &T) -> Option<String> {
         .map(|info| info.peer_addr().to_string())
 }
 
+fn request_network_attempt_id(req: &Request) -> Option<String> {
+    attempt_id_from_proxy_authorization(req.headers().get("proxy-authorization"))
+}
+
 fn json_blocked(host: &str, reason: &str, details: Option<&PolicyDecisionDetails<'_>>) -> Response {
     let (policy_decision_prefix, message, decision, source, protocol, port) = details
         .map(|details| {
@@ -687,6 +700,7 @@ async fn proxy_disabled_response(
             method,
             mode: None,
             protocol: protocol.as_policy_protocol().to_string(),
+            attempt_id: None,
             decision: Some("deny".to_string()),
             source: Some("proxy_state".to_string()),
             port: Some(port),

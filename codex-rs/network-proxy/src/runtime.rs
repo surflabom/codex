@@ -75,6 +75,8 @@ pub struct BlockedRequest {
     pub mode: Option<NetworkMode>,
     pub protocol: String,
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub attempt_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub decision: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub source: Option<String>,
@@ -90,6 +92,7 @@ pub struct BlockedRequestArgs {
     pub method: Option<String>,
     pub mode: Option<NetworkMode>,
     pub protocol: String,
+    pub attempt_id: Option<String>,
     pub decision: Option<String>,
     pub source: Option<String>,
     pub port: Option<u16>,
@@ -104,6 +107,7 @@ impl BlockedRequest {
             method,
             mode,
             protocol,
+            attempt_id,
             decision,
             source,
             port,
@@ -115,6 +119,7 @@ impl BlockedRequest {
             method,
             mode,
             protocol,
+            attempt_id,
             decision,
             source,
             port,
@@ -336,6 +341,7 @@ impl NetworkProxyState {
         let source = entry.source.clone();
         let protocol = entry.protocol.clone();
         let port = entry.port;
+        let attempt_id = entry.attempt_id.clone();
         guard.blocked.push_back(entry);
         guard.blocked_total = guard.blocked_total.saturating_add(1);
         let total = guard.blocked_total;
@@ -343,7 +349,7 @@ impl NetworkProxyState {
             guard.blocked.pop_front();
         }
         debug!(
-            "recorded blocked request telemetry (total={}, host={}, reason={}, decision={:?}, source={:?}, protocol={}, port={:?}, buffered={})",
+            "recorded blocked request telemetry (total={}, host={}, reason={}, decision={:?}, source={:?}, protocol={}, port={:?}, attempt_id={:?}, buffered={})",
             total,
             host,
             reason,
@@ -351,6 +357,7 @@ impl NetworkProxyState {
             source,
             protocol,
             port,
+            attempt_id,
             guard.blocked.len()
         );
         Ok(())
@@ -388,6 +395,20 @@ impl NetworkProxyState {
         self.reload_if_needed().await?;
         let guard = self.state.read().await;
         Ok(guard.blocked.iter().cloned().collect())
+    }
+
+    pub async fn latest_blocked_for_attempt(
+        &self,
+        attempt_id: &str,
+    ) -> Result<Option<BlockedRequest>> {
+        self.reload_if_needed().await?;
+        let guard = self.state.read().await;
+        Ok(guard
+            .blocked
+            .iter()
+            .rev()
+            .find(|entry| entry.attempt_id.as_deref() == Some(attempt_id))
+            .cloned())
     }
 
     /// Drain and return the buffered blocked-request entries in FIFO order.
@@ -741,6 +762,7 @@ mod tests {
                 method: Some("GET".to_string()),
                 mode: None,
                 protocol: "http".to_string(),
+                attempt_id: None,
                 decision: Some("ask".to_string()),
                 source: Some("decider".to_string()),
                 port: Some(80),
@@ -773,6 +795,7 @@ mod tests {
                 method: Some("GET".to_string()),
                 mode: None,
                 protocol: "http".to_string(),
+                attempt_id: None,
                 decision: Some("ask".to_string()),
                 source: Some("decider".to_string()),
                 port: Some(80),
@@ -796,6 +819,64 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn latest_blocked_for_attempt_returns_latest_matching_entry() {
+        let state = network_proxy_state_for_policy(NetworkProxySettings::default());
+
+        state
+            .record_blocked(BlockedRequest::new(BlockedRequestArgs {
+                host: "one.example.com".to_string(),
+                reason: "not_allowed".to_string(),
+                client: None,
+                method: Some("GET".to_string()),
+                mode: None,
+                protocol: "http".to_string(),
+                attempt_id: Some("attempt-1".to_string()),
+                decision: Some("ask".to_string()),
+                source: Some("decider".to_string()),
+                port: Some(80),
+            }))
+            .await
+            .expect("entry should be recorded");
+        state
+            .record_blocked(BlockedRequest::new(BlockedRequestArgs {
+                host: "two.example.com".to_string(),
+                reason: "not_allowed".to_string(),
+                client: None,
+                method: Some("GET".to_string()),
+                mode: None,
+                protocol: "http".to_string(),
+                attempt_id: Some("attempt-2".to_string()),
+                decision: Some("ask".to_string()),
+                source: Some("decider".to_string()),
+                port: Some(80),
+            }))
+            .await
+            .expect("entry should be recorded");
+        state
+            .record_blocked(BlockedRequest::new(BlockedRequestArgs {
+                host: "three.example.com".to_string(),
+                reason: "not_allowed".to_string(),
+                client: None,
+                method: Some("GET".to_string()),
+                mode: None,
+                protocol: "http".to_string(),
+                attempt_id: Some("attempt-1".to_string()),
+                decision: Some("ask".to_string()),
+                source: Some("decider".to_string()),
+                port: Some(80),
+            }))
+            .await
+            .expect("entry should be recorded");
+
+        let latest = state
+            .latest_blocked_for_attempt("attempt-1")
+            .await
+            .expect("lookup should succeed")
+            .expect("attempt should have a blocked entry");
+        assert_eq!(latest.host, "three.example.com");
+    }
+
+    #[tokio::test]
     async fn blocked_since_handles_evicted_old_entries() {
         let state = network_proxy_state_for_policy(NetworkProxySettings::default());
         let cursor = state
@@ -812,6 +893,7 @@ mod tests {
                     method: Some("GET".to_string()),
                     mode: None,
                     protocol: "http".to_string(),
+                    attempt_id: None,
                     decision: Some("ask".to_string()),
                     source: Some("decider".to_string()),
                     port: Some(80),
