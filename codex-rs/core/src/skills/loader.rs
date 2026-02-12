@@ -11,6 +11,9 @@ use crate::skills::model::SkillLoadOutcome;
 use crate::skills::model::SkillMetadata;
 use crate::skills::model::SkillPolicy;
 use crate::skills::model::SkillToolDependency;
+use crate::skills::permissions::SkillManifestPermissions;
+use crate::skills::permissions::SkillPermissionProfile;
+use crate::skills::permissions::compile_permission_profile;
 use crate::skills::system::system_cache_root_dir;
 use codex_app_server_protocol::ConfigLayerSource;
 use codex_protocol::protocol::SkillScope;
@@ -50,6 +53,8 @@ struct SkillMetadataFile {
     dependencies: Option<Dependencies>,
     #[serde(default)]
     policy: Option<Policy>,
+    #[serde(default)]
+    permissions: Option<SkillManifestPermissions>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -490,7 +495,7 @@ fn parse_skill_file(path: &Path, scope: SkillScope) -> Result<SkillMetadata, Ski
         .as_deref()
         .map(sanitize_single_line)
         .filter(|value| !value.is_empty());
-    let (interface, dependencies, policy) = load_skill_metadata(path);
+    let (interface, dependencies, policy, permission_profile) = load_skill_metadata(path);
 
     validate_len(&name, MAX_NAME_LEN, "name")?;
     validate_len(&description, MAX_DESCRIPTION_LEN, "description")?;
@@ -511,6 +516,7 @@ fn parse_skill_file(path: &Path, scope: SkillScope) -> Result<SkillMetadata, Ski
         interface,
         dependencies,
         policy,
+        permission_profile,
         path: resolved_path,
         scope,
     })
@@ -522,16 +528,17 @@ fn load_skill_metadata(
     Option<SkillInterface>,
     Option<SkillDependencies>,
     Option<SkillPolicy>,
+    Option<SkillPermissionProfile>,
 ) {
     // Fail open: optional metadata should not block loading SKILL.md.
     let Some(skill_dir) = skill_path.parent() else {
-        return (None, None, None);
+        return (None, None, None, None);
     };
     let metadata_path = skill_dir
         .join(SKILLS_METADATA_DIR)
         .join(SKILLS_METADATA_FILENAME);
     if !metadata_path.exists() {
-        return (None, None, None);
+        return (None, None, None, None);
     }
 
     let contents = match fs::read_to_string(&metadata_path) {
@@ -542,7 +549,7 @@ fn load_skill_metadata(
                 path = metadata_path.display(),
                 label = SKILLS_METADATA_FILENAME
             );
-            return (None, None, None);
+            return (None, None, None, None);
         }
     };
 
@@ -554,7 +561,7 @@ fn load_skill_metadata(
                 path = metadata_path.display(),
                 label = SKILLS_METADATA_FILENAME
             );
-            return (None, None, None);
+            return (None, None, None, None);
         }
     };
 
@@ -562,12 +569,14 @@ fn load_skill_metadata(
         interface,
         dependencies,
         policy,
+        permissions,
     } = parsed;
 
     (
         resolve_interface(interface, skill_dir),
         resolve_dependencies(dependencies),
         resolve_policy(policy),
+        compile_permission_profile(skill_dir, permissions),
     )
 }
 
@@ -1021,6 +1030,7 @@ mod tests {
                 interface: None,
                 dependencies: None,
                 policy: None,
+                permission_profile: None,
                 path: normalized(&skill_path),
                 scope: SkillScope::User,
             }]
@@ -1168,6 +1178,7 @@ mod tests {
                     ],
                 }),
                 policy: None,
+                permission_profile: None,
                 path: normalized(&skill_path),
                 scope: SkillScope::User,
             }]
@@ -1223,6 +1234,7 @@ interface:
                 }),
                 dependencies: None,
                 policy: None,
+                permission_profile: None,
                 path: normalized(skill_path.as_path()),
                 scope: SkillScope::User,
             }]
@@ -1296,6 +1308,73 @@ policy: {}
     }
 
     #[tokio::test]
+    async fn loads_skill_permissions_from_yaml() {
+        let codex_home = tempfile::tempdir().expect("tempdir");
+        let skill_path = write_skill(&codex_home, "demo", "permissions-skill", "from yaml");
+        let skill_dir = skill_path.parent().expect("skill dir");
+        fs::create_dir_all(skill_dir.join("data")).expect("create read path");
+
+        write_skill_metadata_at(
+            skill_dir,
+            r#"
+permissions:
+  network: true
+  fs_read:
+    - "./data"
+    - "./data"
+  fs_write:
+    - "./output"
+"#,
+        );
+
+        let cfg = make_config(&codex_home).await;
+        let outcome = load_skills(&cfg);
+
+        assert!(
+            outcome.errors.is_empty(),
+            "unexpected errors: {:?}",
+            outcome.errors
+        );
+        assert_eq!(outcome.skills.len(), 1);
+        assert_eq!(
+            outcome.skills[0].permission_profile,
+            Some(crate::skills::permissions::SkillPermissionProfile {
+                sandbox_policy: crate::skills::permissions::SkillSandboxPermissionPolicy {
+                    network: true,
+                    fs_read: vec![normalized(skill_dir.join("data").as_path())],
+                    fs_write: vec![normalized(skill_dir.join("output").as_path())],
+                },
+                macos_seatbelt_permission_file: String::new(),
+            })
+        );
+    }
+
+    #[tokio::test]
+    async fn empty_skill_permissions_do_not_create_profile() {
+        let codex_home = tempfile::tempdir().expect("tempdir");
+        let skill_path = write_skill(&codex_home, "demo", "permissions-empty", "from yaml");
+        let skill_dir = skill_path.parent().expect("skill dir");
+
+        write_skill_metadata_at(
+            skill_dir,
+            r#"
+permissions: {}
+"#,
+        );
+
+        let cfg = make_config(&codex_home).await;
+        let outcome = load_skills(&cfg);
+
+        assert!(
+            outcome.errors.is_empty(),
+            "unexpected errors: {:?}",
+            outcome.errors
+        );
+        assert_eq!(outcome.skills.len(), 1);
+        assert_eq!(outcome.skills[0].permission_profile, None);
+    }
+
+    #[tokio::test]
     async fn accepts_icon_paths_under_assets_dir() {
         let codex_home = tempfile::tempdir().expect("tempdir");
         let skill_path = write_skill(&codex_home, "demo", "ui-skill", "from json");
@@ -1339,6 +1418,7 @@ policy: {}
                 }),
                 dependencies: None,
                 policy: None,
+                permission_profile: None,
                 path: normalized(&skill_path),
                 scope: SkillScope::User,
             }]
@@ -1379,6 +1459,7 @@ policy: {}
                 interface: None,
                 dependencies: None,
                 policy: None,
+                permission_profile: None,
                 path: normalized(&skill_path),
                 scope: SkillScope::User,
             }]
@@ -1432,6 +1513,7 @@ policy: {}
                 }),
                 dependencies: None,
                 policy: None,
+                permission_profile: None,
                 path: normalized(&skill_path),
                 scope: SkillScope::User,
             }]
@@ -1473,6 +1555,7 @@ policy: {}
                 interface: None,
                 dependencies: None,
                 policy: None,
+                permission_profile: None,
                 path: normalized(&skill_path),
                 scope: SkillScope::User,
             }]
@@ -1517,6 +1600,7 @@ policy: {}
                 interface: None,
                 dependencies: None,
                 policy: None,
+                permission_profile: None,
                 path: normalized(&shared_skill_path),
                 scope: SkillScope::User,
             }]
@@ -1577,6 +1661,7 @@ policy: {}
                 interface: None,
                 dependencies: None,
                 policy: None,
+                permission_profile: None,
                 path: normalized(&skill_path),
                 scope: SkillScope::User,
             }]
@@ -1613,6 +1698,7 @@ policy: {}
                 interface: None,
                 dependencies: None,
                 policy: None,
+                permission_profile: None,
                 path: normalized(&shared_skill_path),
                 scope: SkillScope::Admin,
             }]
@@ -1653,6 +1739,7 @@ policy: {}
                 interface: None,
                 dependencies: None,
                 policy: None,
+                permission_profile: None,
                 path: normalized(&linked_skill_path),
                 scope: SkillScope::Repo,
             }]
@@ -1720,6 +1807,7 @@ policy: {}
                 interface: None,
                 dependencies: None,
                 policy: None,
+                permission_profile: None,
                 path: normalized(&within_depth_path),
                 scope: SkillScope::User,
             }]
@@ -1747,6 +1835,7 @@ policy: {}
                 interface: None,
                 dependencies: None,
                 policy: None,
+                permission_profile: None,
                 path: normalized(&skill_path),
                 scope: SkillScope::User,
             }]
@@ -1778,6 +1867,7 @@ policy: {}
                 interface: None,
                 dependencies: None,
                 policy: None,
+                permission_profile: None,
                 path: normalized(&skill_path),
                 scope: SkillScope::User,
             }]
@@ -1890,6 +1980,7 @@ policy: {}
                 interface: None,
                 dependencies: None,
                 policy: None,
+                permission_profile: None,
                 path: normalized(&skill_path),
                 scope: SkillScope::Repo,
             }]
@@ -1925,6 +2016,7 @@ policy: {}
                 interface: None,
                 dependencies: None,
                 policy: None,
+                permission_profile: None,
                 path: normalized(&skill_path),
                 scope: SkillScope::Repo,
             }]
@@ -1978,6 +2070,7 @@ policy: {}
                     interface: None,
                     dependencies: None,
                     policy: None,
+                    permission_profile: None,
                     path: normalized(&nested_skill_path),
                     scope: SkillScope::Repo,
                 },
@@ -1988,6 +2081,7 @@ policy: {}
                     interface: None,
                     dependencies: None,
                     policy: None,
+                    permission_profile: None,
                     path: normalized(&root_skill_path),
                     scope: SkillScope::Repo,
                 },
@@ -2027,6 +2121,7 @@ policy: {}
                 interface: None,
                 dependencies: None,
                 policy: None,
+                permission_profile: None,
                 path: normalized(&skill_path),
                 scope: SkillScope::Repo,
             }]
@@ -2064,6 +2159,7 @@ policy: {}
                 interface: None,
                 dependencies: None,
                 policy: None,
+                permission_profile: None,
                 path: normalized(&skill_path),
                 scope: SkillScope::Repo,
             }]
@@ -2105,6 +2201,7 @@ policy: {}
                     interface: None,
                     dependencies: None,
                     policy: None,
+                    permission_profile: None,
                     path: normalized(&repo_skill_path),
                     scope: SkillScope::Repo,
                 },
@@ -2115,6 +2212,7 @@ policy: {}
                     interface: None,
                     dependencies: None,
                     policy: None,
+                    permission_profile: None,
                     path: normalized(&user_skill_path),
                     scope: SkillScope::User,
                 },
@@ -2179,6 +2277,7 @@ policy: {}
                     interface: None,
                     dependencies: None,
                     policy: None,
+                    permission_profile: None,
                     path: first_path,
                     scope: SkillScope::Repo,
                 },
@@ -2189,6 +2288,7 @@ policy: {}
                     interface: None,
                     dependencies: None,
                     policy: None,
+                    permission_profile: None,
                     path: second_path,
                     scope: SkillScope::Repo,
                 },
@@ -2260,6 +2360,7 @@ policy: {}
                 interface: None,
                 dependencies: None,
                 policy: None,
+                permission_profile: None,
                 path: normalized(&skill_path),
                 scope: SkillScope::Repo,
             }]
@@ -2318,6 +2419,7 @@ policy: {}
                 interface: None,
                 dependencies: None,
                 policy: None,
+                permission_profile: None,
                 path: normalized(&skill_path),
                 scope: SkillScope::System,
             }]

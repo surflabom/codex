@@ -23,6 +23,19 @@ dependencies:
 
 policy:
   allow_implicit_invocation: true
+
+permissions:
+  network: true
+  fs_read:
+    - "~/messages/chat.db"
+    - "~/.chatgpt/skills"
+  fs_write:
+    - "~/obsidian/vault"
+  macos_preferences: "readonly"
+  macos_automation:
+    - "com.apple.Notes"
+  macos_accessibility: true
+  macos_calendar: true
 ```
 
 ## Field descriptions and constraints
@@ -47,3 +60,14 @@ Top-level constraints:
 - `policy.allow_implicit_invocation`: When false, the skill is not injected into
   the model context by default, but can still be invoked explicitly via `$skill`.
   Defaults to true.
+- `permissions.network`: Whether network access is requested by the skill.
+- `permissions.fs_read`: Additional filesystem paths the skill expects to read.
+  `~` is expanded to the current user's home directory.
+- `permissions.fs_write`: Additional filesystem paths the skill expects to write.
+  `~` is expanded to the current user's home directory.
+- `permissions.macos_preferences`: macOS preferences access. Supported values:
+  `true`/`false`, `"readonly"`, `"readwrite"`.
+- `permissions.macos_automation`: macOS Apple Events access. Supported values:
+  `true`/`false` or a list of destination bundle IDs.
+- `permissions.macos_accessibility`: Whether Accessibility APIs are requested.
+- `permissions.macos_calendar`: Whether Calendar APIs are requested.
