@@ -5366,9 +5366,9 @@ async fn try_run_sampling_request(
                     .await;
             }
             ResponseEvent::Completed {
-                response_id: _,
+                response_id: _response_id,
                 token_usage,
-                ..
+                can_append: _can_append,
             } => {
                 if let Some(state) = plan_mode_state.as_mut() {
                     flush_proposed_plan_segments_all(&sess, &turn_context, state).await;
