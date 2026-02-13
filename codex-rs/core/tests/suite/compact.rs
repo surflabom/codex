@@ -1886,6 +1886,116 @@ async fn pre_sampling_compact_runs_after_resume_and_switch_to_smaller_model() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn pre_sampling_compact_model_switch_preserves_base_instructions_override() {
+    skip_if_no_network!();
+
+    let server = MockServer::start().await;
+    let previous_model = "gpt-5.2-codex";
+    let next_model = "gpt-5.1-codex-max";
+    let base_instructions_override =
+        "SESSION_BASE_INSTRUCTIONS_OVERRIDE_FOR_MODEL_SWITCH_COMPACTION".to_string();
+
+    let models_mock = mount_models_once(
+        &server,
+        ModelsResponse {
+            models: vec![
+                model_info_with_context_window(previous_model, 273_000),
+                model_info_with_context_window(next_model, 125_000),
+            ],
+        },
+    )
+    .await;
+
+    let request_log = mount_sse_sequence(
+        &server,
+        vec![
+            sse(vec![
+                ev_assistant_message("m1", "before switch"),
+                ev_completed_with_tokens("r1", 120_000),
+            ]),
+            sse(vec![
+                ev_assistant_message("m2", "PRE_SAMPLING_SUMMARY"),
+                ev_completed_with_tokens("r2", 10),
+            ]),
+            sse(vec![
+                ev_assistant_message("m3", "after switch"),
+                ev_completed_with_tokens("r3", 100),
+            ]),
+        ],
+    )
+    .await;
+
+    let model_provider = non_openai_model_provider(&server);
+    let mut builder = test_codex()
+        .with_auth(CodexAuth::create_dummy_chatgpt_auth_for_testing())
+        .with_model(previous_model)
+        .with_config({
+            let base_instructions_override = base_instructions_override.clone();
+            move |config| {
+                config.model_provider = model_provider;
+                config.base_instructions = Some(base_instructions_override.clone());
+                set_test_compact_prompt(config);
+                config.features.enable(Feature::RemoteModels);
+            }
+        });
+    let test = builder.build(&server).await.expect("build test codex");
+
+    test.codex
+        .submit(Op::UserTurn {
+            items: vec![UserInput::Text {
+                text: "before switch".into(),
+                text_elements: Vec::new(),
+            }],
+            final_output_json_schema: None,
+            cwd: test.cwd.path().to_path_buf(),
+            approval_policy: AskForApproval::Never,
+            sandbox_policy: SandboxPolicy::DangerFullAccess,
+            model: previous_model.to_string(),
+            effort: None,
+            summary: ReasoningSummary::Auto,
+            collaboration_mode: None,
+            personality: None,
+        })
+        .await
+        .expect("submit first user turn");
+    wait_for_event(&test.codex, |event| {
+        matches!(event, EventMsg::TurnComplete(_))
+    })
+    .await;
+
+    test.codex
+        .submit(Op::UserTurn {
+            items: vec![UserInput::Text {
+                text: "after switch".into(),
+                text_elements: Vec::new(),
+            }],
+            final_output_json_schema: None,
+            cwd: test.cwd.path().to_path_buf(),
+            approval_policy: AskForApproval::Never,
+            sandbox_policy: SandboxPolicy::DangerFullAccess,
+            model: next_model.to_string(),
+            effort: None,
+            summary: ReasoningSummary::Auto,
+            collaboration_mode: None,
+            personality: None,
+        })
+        .await
+        .expect("submit second user turn");
+    assert_compaction_uses_turn_lifecycle_id(&test.codex).await;
+
+    let requests = request_log.requests();
+    assert_eq!(models_mock.requests().len(), 1);
+    assert_eq!(
+        requests.len(),
+        3,
+        "expected user, compact, and follow-up requests"
+    );
+    assert_eq!(requests[0].instructions_text(), base_instructions_override);
+    assert_eq!(requests[1].instructions_text(), base_instructions_override);
+    assert_eq!(requests[2].instructions_text(), base_instructions_override);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn auto_compact_persists_rollout_entries() {
     skip_if_no_network!();
 
