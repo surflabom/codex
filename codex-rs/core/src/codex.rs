@@ -4126,11 +4126,26 @@ pub(crate) async fn run_turn(
         collaboration_mode_kind: turn_context.collaboration_mode.mode,
     });
     sess.send_event(&turn_context, event).await;
-    if run_pre_sampling_compact(&sess, &turn_context)
-        .await
-        .is_err()
-    {
-        error!("Failed to run pre-sampling compact");
+    let total_usage_tokens_before_compaction = sess.get_total_token_usage().await;
+    let previous_model_before_compaction = sess.previous_model().await;
+    let previous_model_compaction_turn_context = previous_model_compaction_context(
+        &sess,
+        &turn_context,
+        previous_model_before_compaction.as_deref(),
+        total_usage_tokens_before_compaction,
+    )
+    .await;
+    if let Err(err) = run_pre_sampling_compact(&sess, &turn_context).await {
+        if let Some(previous_turn_context) = previous_model_compaction_turn_context {
+            rollback_model_switch_after_failed_pre_sampling_compaction(
+                &sess,
+                &turn_context,
+                previous_turn_context.as_ref(),
+                &err,
+            )
+            .await;
+        }
+        error!(compact_error = %err, "Failed to run pre-sampling compact");
         return None;
     }
 
@@ -4412,6 +4427,32 @@ async fn run_pre_sampling_compact(
         run_auto_compact(sess, turn_context).await?;
     }
     Ok(())
+}
+
+async fn rollback_model_switch_after_failed_pre_sampling_compaction(
+    sess: &Arc<Session>,
+    turn_context: &Arc<TurnContext>,
+    previous_turn_context: &TurnContext,
+    compact_error: &CodexErr,
+) {
+    let restored_model = previous_turn_context.model_info.slug.clone();
+    let update = SessionSettingsUpdate {
+        collaboration_mode: Some(previous_turn_context.collaboration_mode.clone()),
+        ..Default::default()
+    };
+    if let Err(err) = sess.update_settings(update).await {
+        warn!(restore_model = %restored_model, update_error = %err, "failed to restore model after pre-sampling compaction failure");
+    }
+    sess.set_previous_model(Some(restored_model.clone())).await;
+    let message = format!(
+        "Failed to switch to model `{}` during pre-sampling compaction ({}). Reverted to `{}`.",
+        turn_context.model_info.slug, compact_error, restored_model
+    );
+    sess.send_event(
+        turn_context,
+        EventMsg::Error(compact_error.to_error_event(Some(message))),
+    )
+    .await;
 }
 
 async fn previous_model_compaction_context(
