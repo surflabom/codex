@@ -7,7 +7,6 @@ use crate::client_common::ResponseEvent;
 use crate::codex::Session;
 use crate::codex::TurnContext;
 use crate::codex::get_last_assistant_message_from_turn;
-use crate::context_manager::ContextManager;
 use crate::error::CodexErr;
 use crate::error::Result as CodexResult;
 use crate::protocol::CompactedItem;
@@ -77,7 +76,6 @@ async fn run_compact_task_inner(
     let initial_input_for_turn: ResponseInputItem = ResponseInputItem::from(input);
 
     let mut history = sess.clone_history().await;
-    strip_model_switch_developer_messages(&mut history);
     history.record_items(
         &[initial_input_for_turn.into()],
         turn_context.truncation_policy,
@@ -237,27 +235,6 @@ pub fn content_items_to_text(content: &[ContentItem]) -> Option<String> {
     } else {
         Some(pieces.join("\n"))
     }
-}
-
-pub(crate) fn strip_model_switch_developer_messages(history: &mut ContextManager) {
-    let raw_items = history.raw_items();
-    let filtered = raw_items
-        .iter()
-        .filter(|item| !is_model_switch_developer_message(item))
-        .cloned()
-        .collect::<Vec<_>>();
-    if filtered.len() != raw_items.len() {
-        history.replace(filtered);
-    }
-}
-
-fn is_model_switch_developer_message(item: &ResponseItem) -> bool {
-    if let ResponseItem::Message { role, content, .. } = item {
-        return role == "developer"
-            && content_items_to_text(content)
-                .is_some_and(|text| text.starts_with("<model_switch>"));
-    }
-    false
 }
 
 pub(crate) fn collect_user_messages(items: &[ResponseItem]) -> Vec<String> {

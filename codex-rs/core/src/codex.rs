@@ -3133,6 +3133,7 @@ async fn submission_loop(sess: Arc<Session>, config: Arc<Config>, rx_sub: Receiv
 
 /// Operation handlers
 mod handlers {
+    use super::previous_model_compaction_context;
     use crate::codex::Session;
     use crate::codex::SessionSettingsUpdate;
     use crate::codex::SteerInputError;
@@ -3178,6 +3179,8 @@ mod handlers {
     use codex_protocol::config_types::Settings;
     use codex_protocol::dynamic_tools::DynamicToolResponse;
     use codex_protocol::mcp::RequestId as ProtocolRequestId;
+    use codex_protocol::models::ContentItem;
+    use codex_protocol::models::ResponseItem;
     use codex_protocol::user_input::UserInput;
     use codex_rmcp_client::ElicitationAction;
     use codex_rmcp_client::ElicitationResponse;
@@ -3277,13 +3280,39 @@ mod handlers {
         if let Err(SteerInputError::NoActiveTurn(items)) = sess.steer_input(items, None).await {
             sess.seed_initial_context_if_needed(&current_context).await;
             let previous_model = sess.previous_model().await;
+            let total_usage_tokens = sess.get_total_token_usage().await;
+            let should_skip_trailing_model_switch_update = previous_model_compaction_context(
+                sess,
+                &current_context,
+                previous_model.as_deref(),
+                total_usage_tokens,
+            )
+            .await
+            .is_some();
             let update_items = sess.build_settings_update_items(
                 previous_context.as_ref(),
                 previous_model.as_deref(),
                 &current_context,
             );
-            if !update_items.is_empty() {
-                sess.record_conversation_items(&current_context, &update_items)
+            let mut persisted_update_items = update_items;
+            if should_skip_trailing_model_switch_update {
+                persisted_update_items.retain(|item| {
+                    let ResponseItem::Message { role, content, .. } = item else {
+                        return true;
+                    };
+                    if role != "developer" {
+                        return true;
+                    }
+                    !content.iter().any(|content_item| {
+                        matches!(
+                            content_item,
+                            ContentItem::InputText { text } if text.starts_with("<model_switch>")
+                        )
+                    })
+                });
+            }
+            if !persisted_update_items.is_empty() {
+                sess.record_conversation_items(&current_context, &persisted_update_items)
                     .await;
             }
 
@@ -4358,9 +4387,11 @@ async fn run_pre_sampling_compact(
     turn_context: &Arc<TurnContext>,
 ) -> CodexResult<()> {
     let total_usage_tokens_before_compaction = sess.get_total_token_usage().await;
+    let previous_model = sess.previous_model().await;
     let ran_previous_model_compaction = maybe_run_previous_model_inline_compact(
         sess,
         turn_context,
+        previous_model.as_deref(),
         total_usage_tokens_before_compaction,
     )
     .await?;
@@ -4389,35 +4420,17 @@ async fn run_pre_sampling_compact(
 async fn maybe_run_previous_model_inline_compact(
     sess: &Arc<Session>,
     turn_context: &Arc<TurnContext>,
+    previous_model: Option<&str>,
     total_usage_tokens: i64,
 ) -> CodexResult<bool> {
-    let Some(previous_model) = sess.previous_model().await else {
+    let Some(previous_turn_context) =
+        previous_model_compaction_context(sess, turn_context, previous_model, total_usage_tokens)
+            .await
+    else {
         return Ok(false);
     };
-    let previous_turn_context = Arc::new(
-        turn_context
-            .with_model(previous_model, &sess.services.models_manager)
-            .await,
-    );
-
-    let Some(old_context_window) = previous_turn_context.model_context_window() else {
-        return Ok(false);
-    };
-    let Some(new_context_window) = turn_context.model_context_window() else {
-        return Ok(false);
-    };
-    let new_auto_compact_limit = turn_context
-        .model_info
-        .auto_compact_token_limit()
-        .unwrap_or(i64::MAX);
-    let should_run = total_usage_tokens > new_auto_compact_limit
-        && previous_turn_context.model_info.slug != turn_context.model_info.slug
-        && old_context_window > new_context_window;
-    if should_run {
-        run_auto_compact(sess, &previous_turn_context).await?;
-        return Ok(true);
-    }
-    Ok(false)
+    run_auto_compact(sess, &previous_turn_context).await?;
+    Ok(true)
 }
 
 async fn run_auto_compact(sess: &Arc<Session>, turn_context: &Arc<TurnContext>) -> CodexResult<()> {
@@ -4427,6 +4440,30 @@ async fn run_auto_compact(sess: &Arc<Session>, turn_context: &Arc<TurnContext>) 
         run_inline_auto_compact_task(Arc::clone(sess), Arc::clone(turn_context)).await?;
     }
     Ok(())
+}
+
+async fn previous_model_compaction_context(
+    sess: &Arc<Session>,
+    turn_context: &Arc<TurnContext>,
+    previous_model: Option<&str>,
+    total_usage_tokens: i64,
+) -> Option<Arc<TurnContext>> {
+    let previous_model = previous_model?;
+    let previous_turn_context = Arc::new(
+        turn_context
+            .with_model(previous_model.to_string(), &sess.services.models_manager)
+            .await,
+    );
+    let old_context_window = previous_turn_context.model_context_window()?;
+    let new_context_window = turn_context.model_context_window()?;
+    let new_auto_compact_limit = turn_context
+        .model_info
+        .auto_compact_token_limit()
+        .unwrap_or(i64::MAX);
+    let should_run = total_usage_tokens > new_auto_compact_limit
+        && previous_turn_context.model_info.slug != turn_context.model_info.slug
+        && old_context_window > new_context_window;
+    should_run.then_some(previous_turn_context)
 }
 
 fn collect_explicit_app_ids_from_skill_items(

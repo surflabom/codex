@@ -147,7 +147,7 @@ fn assert_pre_sampling_switch_compaction_requests(
     );
     assert!(
         !compact_body.contains("<model_switch>"),
-        "pre-sampling compact request should not include model-switch developer instructions"
+        "pre-sampling compact request should not include the trailing model-switch update item"
     );
 }
 
