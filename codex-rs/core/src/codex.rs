@@ -1927,14 +1927,14 @@ impl Session {
         {
             update_items.push(collaboration_mode_item);
         }
-        if include_model_switch_update {
-            if let Some(model_instructions_item) = self.build_model_instructions_update_item(
+        if include_model_switch_update
+            && let Some(model_instructions_item) = self.build_model_instructions_update_item(
                 previous_context,
                 resumed_model,
                 current_context,
-            ) {
-                update_items.push(model_instructions_item);
-            }
+            )
+        {
+            update_items.push(model_instructions_item);
         }
         if let Some(personality_item) =
             self.build_personality_update_item(previous_context, current_context)
