@@ -1909,6 +1909,7 @@ impl Session {
         previous_context: Option<&Arc<TurnContext>>,
         resumed_model: Option<&str>,
         current_context: &TurnContext,
+        include_model_switch_update: bool,
     ) -> Vec<ResponseItem> {
         let mut update_items = Vec::new();
         if let Some(env_item) =
@@ -1926,12 +1927,14 @@ impl Session {
         {
             update_items.push(collaboration_mode_item);
         }
-        if let Some(model_instructions_item) = self.build_model_instructions_update_item(
-            previous_context,
-            resumed_model,
-            current_context,
-        ) {
-            update_items.push(model_instructions_item);
+        if include_model_switch_update {
+            if let Some(model_instructions_item) = self.build_model_instructions_update_item(
+                previous_context,
+                resumed_model,
+                current_context,
+            ) {
+                update_items.push(model_instructions_item);
+            }
         }
         if let Some(personality_item) =
             self.build_personality_update_item(previous_context, current_context)
@@ -3179,8 +3182,6 @@ mod handlers {
     use codex_protocol::config_types::Settings;
     use codex_protocol::dynamic_tools::DynamicToolResponse;
     use codex_protocol::mcp::RequestId as ProtocolRequestId;
-    use codex_protocol::models::ContentItem;
-    use codex_protocol::models::ResponseItem;
     use codex_protocol::user_input::UserInput;
     use codex_rmcp_client::ElicitationAction;
     use codex_rmcp_client::ElicitationResponse;
@@ -3281,7 +3282,9 @@ mod handlers {
             sess.seed_initial_context_if_needed(&current_context).await;
             let previous_model = sess.previous_model().await;
             let total_usage_tokens = sess.get_total_token_usage().await;
-            let should_skip_trailing_model_switch_update = previous_model_compaction_context(
+            // If we are about to run previous-model pre-sampling compaction, do not emit the
+            // trailing <model_switch> update item for this turn.
+            let will_run_previous_model_compaction = previous_model_compaction_context(
                 sess,
                 &current_context,
                 previous_model.as_deref(),
@@ -3293,26 +3296,10 @@ mod handlers {
                 previous_context.as_ref(),
                 previous_model.as_deref(),
                 &current_context,
+                !will_run_previous_model_compaction,
             );
-            let mut persisted_update_items = update_items;
-            if should_skip_trailing_model_switch_update {
-                persisted_update_items.retain(|item| {
-                    let ResponseItem::Message { role, content, .. } = item else {
-                        return true;
-                    };
-                    if role != "developer" {
-                        return true;
-                    }
-                    !content.iter().any(|content_item| {
-                        matches!(
-                            content_item,
-                            ContentItem::InputText { text } if text.starts_with("<model_switch>")
-                        )
-                    })
-                });
-            }
-            if !persisted_update_items.is_empty() {
-                sess.record_conversation_items(&current_context, &persisted_update_items)
+            if !update_items.is_empty() {
+                sess.record_conversation_items(&current_context, &update_items)
                     .await;
             }
 
