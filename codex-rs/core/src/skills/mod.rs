@@ -20,6 +20,5 @@ pub use model::SkillLoadOutcome;
 pub use model::SkillMetadata;
 pub use model::SkillPolicy;
 pub use permissions::SkillPermissionProfile;
-pub use permissions::SkillSandboxPermissionPolicy;
 pub use permissions::permission_profile_for_executable;
 pub use render::render_skills_section;

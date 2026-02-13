@@ -1,24 +1,21 @@
 use std::collections::HashSet;
+use std::path::Component;
 use std::path::Path;
 use std::path::PathBuf;
 
+use codex_utils_absolute_path::AbsolutePathBuf;
 use dirs::home_dir;
 use dunce::canonicalize as canonicalize_path;
 use serde::Deserialize;
 use tracing::warn;
 
+use crate::protocol::ReadOnlyAccess;
+use crate::protocol::SandboxPolicy;
 use crate::skills::model::SkillMetadata;
 
-#[derive(Debug, Clone, PartialEq, Eq, Default)]
-pub struct SkillSandboxPermissionPolicy {
-    pub network: bool,
-    pub fs_read: Vec<PathBuf>,
-    pub fs_write: Vec<PathBuf>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SkillPermissionProfile {
-    pub sandbox_policy: SkillSandboxPermissionPolicy,
+    pub sandbox_policy: SandboxPolicy,
     pub macos_seatbelt_permission_file: String,
 }
 
@@ -59,27 +56,46 @@ pub(crate) fn compile_permission_profile(
     permissions: Option<SkillManifestPermissions>,
 ) -> Option<SkillPermissionProfile> {
     let permissions = permissions?;
-    let sandbox_policy = SkillSandboxPermissionPolicy {
-        network: permissions.network,
-        fs_read: normalize_permission_paths(skill_dir, &permissions.fs_read, "permissions.fs_read"),
-        fs_write: normalize_permission_paths(
-            skill_dir,
-            &permissions.fs_write,
-            "permissions.fs_write",
-        ),
+    let fs_read =
+        normalize_permission_paths(skill_dir, &permissions.fs_read, "permissions.fs_read");
+    let fs_write =
+        normalize_permission_paths(skill_dir, &permissions.fs_write, "permissions.fs_write");
+    let has_sandbox_permissions =
+        permissions.network || !fs_read.is_empty() || !fs_write.is_empty();
+    let sandbox_policy = if permissions.network || !fs_write.is_empty() {
+        SandboxPolicy::WorkspaceWrite {
+            writable_roots: fs_write,
+            read_only_access: if fs_read.is_empty() {
+                ReadOnlyAccess::FullAccess
+            } else {
+                ReadOnlyAccess::Restricted {
+                    include_platform_defaults: true,
+                    readable_roots: fs_read,
+                }
+            },
+            network_access: permissions.network,
+            exclude_tmpdir_env_var: false,
+            exclude_slash_tmp: false,
+        }
+    } else if !fs_read.is_empty() {
+        SandboxPolicy::ReadOnly {
+            access: ReadOnlyAccess::Restricted {
+                include_platform_defaults: true,
+                readable_roots: fs_read,
+            },
+        }
+    } else {
+        SandboxPolicy::new_read_only_policy()
     };
     let macos_seatbelt_permission_file = build_macos_seatbelt_permission_file(&permissions);
-    let profile = SkillPermissionProfile {
+    if !has_sandbox_permissions && macos_seatbelt_permission_file.is_empty() {
+        return None;
+    }
+
+    Some(SkillPermissionProfile {
         sandbox_policy,
         macos_seatbelt_permission_file,
-    };
-    if profile.sandbox_policy == SkillSandboxPermissionPolicy::default()
-        && profile.macos_seatbelt_permission_file.is_empty()
-    {
-        None
-    } else {
-        Some(profile)
-    }
+    })
 }
 
 pub fn permission_profile_for_executable<'a>(
@@ -111,7 +127,11 @@ pub fn permission_profile_for_executable<'a>(
     best_match.map(|(_, profile)| profile)
 }
 
-fn normalize_permission_paths(skill_dir: &Path, values: &[String], field: &str) -> Vec<PathBuf> {
+fn normalize_permission_paths(
+    skill_dir: &Path,
+    values: &[String],
+    field: &str,
+) -> Vec<AbsolutePathBuf> {
     let mut paths = Vec::new();
     let mut seen = HashSet::new();
 
@@ -127,7 +147,11 @@ fn normalize_permission_paths(skill_dir: &Path, values: &[String], field: &str) 
     paths
 }
 
-fn normalize_permission_path(skill_dir: &Path, value: &str, field: &str) -> Option<PathBuf> {
+fn normalize_permission_path(
+    skill_dir: &Path,
+    value: &str,
+    field: &str,
+) -> Option<AbsolutePathBuf> {
     let trimmed = value.trim();
     if trimmed.is_empty() {
         warn!("ignoring {field}: value is empty");
@@ -141,7 +165,15 @@ fn normalize_permission_path(skill_dir: &Path, value: &str, field: &str) -> Opti
     } else {
         skill_dir.join(path)
     };
-    Some(canonicalize_path(&absolute).unwrap_or(absolute))
+    let normalized = normalize_lexically(&absolute);
+    let canonicalized = canonicalize_path(&normalized).unwrap_or(normalized);
+    match AbsolutePathBuf::from_absolute_path(&canonicalized) {
+        Ok(path) => Some(path),
+        Err(error) => {
+            warn!("ignoring {field}: expected absolute path, got {canonicalized:?}: {error}");
+            None
+        }
+    }
 }
 
 fn expand_home(path: &str) -> String {
@@ -161,8 +193,6 @@ fn expand_home(path: &str) -> String {
 
 #[cfg(target_os = "macos")]
 fn build_macos_seatbelt_permission_file(permissions: &SkillManifestPermissions) -> String {
-    use crate::seatbelt_permissions::MacOsAutomationPermission;
-    use crate::seatbelt_permissions::MacOsPreferencesPermission;
     use crate::seatbelt_permissions::MacOsSeatbeltProfileExtensions;
     use crate::seatbelt_permissions::build_seatbelt_extensions;
 
@@ -238,14 +268,33 @@ fn build_macos_seatbelt_permission_file(_: &SkillManifestPermissions) -> String 
     String::new()
 }
 
+fn normalize_lexically(path: &Path) -> PathBuf {
+    let mut normalized = PathBuf::new();
+    for component in path.components() {
+        match component {
+            Component::CurDir => {}
+            Component::ParentDir => {
+                normalized.pop();
+            }
+            Component::RootDir | Component::Prefix(_) | Component::Normal(_) => {
+                normalized.push(component.as_os_str());
+            }
+        }
+    }
+    normalized
+}
+
 #[cfg(test)]
 mod tests {
     use super::SkillManifestPermissions;
     use super::SkillPermissionProfile;
     use super::compile_permission_profile;
     use super::permission_profile_for_executable;
+    use crate::protocol::ReadOnlyAccess;
+    use crate::protocol::SandboxPolicy;
     use crate::skills::model::SkillMetadata;
     use codex_protocol::protocol::SkillScope;
+    use codex_utils_absolute_path::AbsolutePathBuf;
     use pretty_assertions::assert_eq;
     use std::fs;
 
@@ -272,11 +321,26 @@ mod tests {
         )
         .expect("profile");
 
-        assert!(profile.sandbox_policy.network);
-        assert_eq!(profile.sandbox_policy.fs_read, vec![read_dir]);
         assert_eq!(
-            profile.sandbox_policy.fs_write,
-            vec![skill_dir.join("output")]
+            profile.sandbox_policy,
+            SandboxPolicy::WorkspaceWrite {
+                writable_roots: vec![
+                    AbsolutePathBuf::try_from(skill_dir.join("output"))
+                        .expect("absolute output path")
+                ],
+                read_only_access: ReadOnlyAccess::Restricted {
+                    include_platform_defaults: true,
+                    readable_roots: vec![
+                        AbsolutePathBuf::try_from(
+                            dunce::canonicalize(&read_dir).unwrap_or(read_dir)
+                        )
+                        .expect("absolute read path")
+                    ],
+                },
+                network_access: true,
+                exclude_tmpdir_env_var: false,
+                exclude_slash_tmp: false,
+            }
         );
     }
 
@@ -328,7 +392,10 @@ mod tests {
         let script_path = skill_dir.join("scripts").join("run.sh");
         fs::write(&script_path, "#!/bin/sh\nexit 0\n").expect("script");
 
-        let profile = SkillPermissionProfile::default();
+        let profile = SkillPermissionProfile {
+            sandbox_policy: SandboxPolicy::new_read_only_policy(),
+            macos_seatbelt_permission_file: String::new(),
+        };
         let skill = SkillMetadata {
             name: "demo".to_string(),
             description: "demo".to_string(),

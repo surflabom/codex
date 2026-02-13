@@ -1313,6 +1313,7 @@ policy: {}
         let skill_path = write_skill(&codex_home, "demo", "permissions-skill", "from yaml");
         let skill_dir = skill_path.parent().expect("skill dir");
         fs::create_dir_all(skill_dir.join("data")).expect("create read path");
+        fs::create_dir_all(skill_dir.join("output")).expect("create write path");
 
         write_skill_metadata_at(
             skill_dir,
@@ -1339,10 +1340,23 @@ permissions:
         assert_eq!(
             outcome.skills[0].permission_profile,
             Some(crate::skills::permissions::SkillPermissionProfile {
-                sandbox_policy: crate::skills::permissions::SkillSandboxPermissionPolicy {
-                    network: true,
-                    fs_read: vec![normalized(skill_dir.join("data").as_path())],
-                    fs_write: vec![normalized(skill_dir.join("output").as_path())],
+                sandbox_policy: crate::protocol::SandboxPolicy::WorkspaceWrite {
+                    writable_roots: vec![
+                        AbsolutePathBuf::try_from(normalized(skill_dir.join("output").as_path(),))
+                            .expect("absolute output path")
+                    ],
+                    read_only_access: crate::protocol::ReadOnlyAccess::Restricted {
+                        include_platform_defaults: true,
+                        readable_roots: vec![
+                            AbsolutePathBuf::try_from(
+                                normalized(skill_dir.join("data").as_path(),)
+                            )
+                            .expect("absolute data path")
+                        ],
+                    },
+                    network_access: true,
+                    exclude_tmpdir_env_var: false,
+                    exclude_slash_tmp: false,
                 },
                 macos_seatbelt_permission_file: String::new(),
             })
