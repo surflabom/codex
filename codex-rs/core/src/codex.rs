@@ -4398,6 +4398,30 @@ async fn run_pre_sampling_compact(
     Ok(())
 }
 
+async fn previous_model_compaction_context(
+    sess: &Arc<Session>,
+    turn_context: &Arc<TurnContext>,
+    previous_model: Option<&str>,
+    total_usage_tokens: i64,
+) -> Option<Arc<TurnContext>> {
+    let previous_model = previous_model?;
+    let previous_turn_context = Arc::new(
+        turn_context
+            .with_model(previous_model.to_string(), &sess.services.models_manager)
+            .await,
+    );
+    let old_context_window = previous_turn_context.model_context_window()?;
+    let new_context_window = turn_context.model_context_window()?;
+    let new_auto_compact_limit = turn_context
+        .model_info
+        .auto_compact_token_limit()
+        .unwrap_or(i64::MAX);
+    let should_run = total_usage_tokens > new_auto_compact_limit
+        && previous_turn_context.model_info.slug != turn_context.model_info.slug
+        && old_context_window > new_context_window;
+    should_run.then_some(previous_turn_context)
+}
+
 /// Runs pre-sampling auto-compaction against the previous model when switching to a smaller
 /// context window model.
 ///
@@ -4427,30 +4451,6 @@ async fn run_auto_compact(sess: &Arc<Session>, turn_context: &Arc<TurnContext>) 
         run_inline_auto_compact_task(Arc::clone(sess), Arc::clone(turn_context)).await?;
     }
     Ok(())
-}
-
-async fn previous_model_compaction_context(
-    sess: &Arc<Session>,
-    turn_context: &Arc<TurnContext>,
-    previous_model: Option<&str>,
-    total_usage_tokens: i64,
-) -> Option<Arc<TurnContext>> {
-    let previous_model = previous_model?;
-    let previous_turn_context = Arc::new(
-        turn_context
-            .with_model(previous_model.to_string(), &sess.services.models_manager)
-            .await,
-    );
-    let old_context_window = previous_turn_context.model_context_window()?;
-    let new_context_window = turn_context.model_context_window()?;
-    let new_auto_compact_limit = turn_context
-        .model_info
-        .auto_compact_token_limit()
-        .unwrap_or(i64::MAX);
-    let should_run = total_usage_tokens > new_auto_compact_limit
-        && previous_turn_context.model_info.slug != turn_context.model_info.slug
-        && old_context_window > new_context_window;
-    should_run.then_some(previous_turn_context)
 }
 
 fn collect_explicit_app_ids_from_skill_items(
